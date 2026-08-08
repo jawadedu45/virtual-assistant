@@ -111,7 +111,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
     try:
         response = client.models.generate_content(
-            model="gemini-3.5-flash-lite",
+            model="gemini-3.5-flash",
             contents=request.message,
             config=types.GenerateContentConfig(
                 system_instruction=full_system_prompt,
