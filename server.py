@@ -121,6 +121,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         return {"reply": response.text}
     except Exception as e:
         logger.error(f"Error during chat: {e}")
+        logger.error(f"FULL ERROR REPR: {repr(e)}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
 
 # --- Serve the chat widget (index.html) ---
