@@ -1,5 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -84,7 +86,7 @@ def search_document(question: str) -> str:
 class ChatRequest(BaseModel):
     message: str
 
-@app.get("/")
+@app.get("/api/status")
 def read_root():
     return {"message": "Hello, your server is running!"}
 
@@ -120,3 +122,18 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
+
+# --- Serve the chat widget (index.html) ---
+# This must be registered AFTER all your API routes above,
+# otherwise it can override them.
+@app.get("/index.html")
+def serve_widget():
+    return FileResponse("index.html")
+
+@app.get("/")
+def serve_widget_root():
+    return FileResponse("index.html")
+
+# Serves any other files sitting in the same folder (CSS, JS, images)
+# e.g. a request for /style.css or /widget.js will be found here automatically.
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
