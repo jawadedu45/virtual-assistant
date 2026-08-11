@@ -147,6 +147,16 @@
   .chat-input button:hover {
     background: var(--teal-dark);
   }
+  #mic-btn {
+    padding: 0 14px;
+    background: var(--coral);
+  }
+  #mic-btn.recording {
+    background: #d32f2f;
+  }
+  #mic-btn:hover {
+    background: #e85a3a;
+  }
 </style>
 </head>
 <body>
@@ -166,6 +176,7 @@
 
   <div class="chat-input">
     <input type="text" id="user-input" placeholder="Type a message...">
+    <button id="mic-btn" type="button">🎤</button>
     <button id="send-btn">Send</button>
   </div>
 </div>
@@ -176,7 +187,12 @@
   const messagesEl = document.getElementById('chat-messages');
   const inputEl = document.getElementById('user-input');
   const sendBtn = document.getElementById('send-btn');
+  const micBtn = document.getElementById('mic-btn');
   const nameEl = document.querySelector('.chat-header h1');
+
+  let mediaRecorder;
+  let audioChunks = [];
+  let isRecording = false;
 
   function addBubble(text, sender) {
     const bubble = document.createElement('div');
@@ -242,6 +258,62 @@
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendMessage();
   });
+
+  micBtn.addEventListener('click', async () => {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+          stream.getTracks().forEach(track => track.stop());
+          await sendVoiceMessage(audioBlob);
+        };
+
+        mediaRecorder.start();
+        isRecording = true;
+        micBtn.classList.add('recording');
+        micBtn.textContent = '⏹';
+      } catch (error) {
+        console.error('Microphone access denied:', error);
+        addBubble("I need microphone access to hear you.", 'bot');
+      }
+    } else {
+      mediaRecorder.stop();
+      isRecording = false;
+      micBtn.classList.remove('recording');
+      micBtn.textContent = '🎤';
+    }
+  });
+
+  async function sendVoiceMessage(audioBlob) {
+    showTyping();
+    const reader = new FileReader();
+    reader.readAsDataURL(audioBlob);
+    reader.onloadend = async () => {
+      const base64Audio = reader.result.split(',')[1];
+      try {
+        const response = await fetch('/voice-chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': API_KEY
+          },
+          body: JSON.stringify({ audio_base64: base64Audio, mime_type: 'audio/webm' })
+        });
+        const data = await response.json();
+        hideTyping();
+        if (data.transcript) addBubble(data.transcript, 'user');
+        addBubble(data.reply, 'bot');
+      } catch (error) {
+        hideTyping();
+        addBubble("Sorry, I couldn't process that voice message.", 'bot');
+      }
+    };
+  }
 
   loadSettings();
 </script>
