@@ -13,6 +13,7 @@ import urllib.request
 import os
 import json
 import logging
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,6 +86,9 @@ def search_document(question: str) -> str:
 
 class ChatRequest(BaseModel):
     message: str
+class VoiceRequest(BaseModel):
+    audio_base64: str
+    mime_type: str = "audio/webm"
 
 @app.get("/api/status")
 def read_root():
@@ -93,6 +97,22 @@ def read_root():
 @app.get("/settings")
 def get_settings():
     return {"assistant_name": ASSISTANT_NAME, "greeting": GREETING}
+def generate_reply(message: str) -> str:
+    relevant_chunk = search_document(message)
+    full_system_prompt = (
+        f"{BASE_SYSTEM_PROMPT}\n\n"
+        f"Here is relevant background information you can use if it helps answer the question:\n"
+        f"\"{relevant_chunk}\""
+    )
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=message,
+        config=types.GenerateContentConfig(
+            system_instruction=full_system_prompt,
+            tools=[get_today_date, lookup_faq, get_weather]
+        )
+    )
+    return response.text
 
 @app.post("/chat")
 def chat(request: ChatRequest, x_api_key: str = Header(None)):
@@ -110,19 +130,35 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
     )
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=request.message,
-            config=types.GenerateContentConfig(
-                system_instruction=full_system_prompt,
-                tools=[get_today_date, lookup_faq, get_weather]
-            )
-        )
-        return {"reply": response.text}
+        reply = generate_reply(request.message)
+        return {"reply": reply}
     except Exception as e:
         logger.error(f"Error during chat: {e}")
-        logger.error("FULL ERROR REPR: " + str(e).replace("\n", " | ").replace("{", "[").replace("}", "]"))
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
+
+@app.post("/voice-chat")
+def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
+    if x_api_key != APP_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64)
+
+        transcription_response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=[
+                types.Part.from_bytes(data=audio_bytes, mime_type=request.mime_type),
+                "Transcribe this audio to text. Reply with ONLY the transcribed text, nothing else."
+            ]
+        )
+        transcript = transcription_response.text.strip()
+        logger.info(f"Voice transcript: {transcript}")
+
+        reply = generate_reply(transcript)
+        return {"transcript": transcript, "reply": reply}
+    except Exception as e:
+        logger.error(f"Error during voice chat: {e}")
+        return {"transcript": "", "reply": "Sorry, I couldn't process that voice message."}
 
 # --- Serve the chat widget (index.html) ---
 # This must be registered AFTER all your API routes above,
