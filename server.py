@@ -196,7 +196,8 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         logger.info(f"Voice transcript: {transcript}")
 
         reply = generate_reply(transcript)
-        return {"transcript": transcript, "reply": reply}
+        reply_audio = text_to_speech(reply)
+        return {"transcript": transcript, "reply": reply, "reply_audio": reply_audio}
     except Exception as e:
         logger.error(f"Error during voice chat: {e}")
         return {"transcript": "", "reply": "Sorry, I couldn't process that voice message."}
