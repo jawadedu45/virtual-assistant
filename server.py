@@ -114,6 +114,47 @@ def generate_reply(message: str) -> str:
     )
     return response.text
 
+
+def text_to_speech(text: str) -> str:
+    response = client.models.generate_content(
+        model="gemini-3.1-flash-tts-preview",
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                )
+            ),
+        )
+    )
+    audio_data = response.candidates[0].content.parts[0].inline_data.data
+    return base64.b64encode(audio_data).decode("utf-8")
+    def text_to_speech(text: str) -> str:
+        response = client.models.generate_content(
+        model="gemini-3.1-flash-tts-preview",
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                )
+            ),
+        )
+    )
+    audio_data = response.candidates[0].content.parts[0].inline_data.data
+    return base64.b64encode(audio_data).decode("utf-8")
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=message,
+        config=types.GenerateContentConfig(
+            system_instruction=full_system_prompt,
+            tools=[get_today_date, lookup_faq, get_weather]
+        )
+    )
+    return response.text
+
 @app.post("/chat")
 def chat(request: ChatRequest, x_api_key: str = Header(None)):
     if x_api_key != APP_SECRET_KEY:
