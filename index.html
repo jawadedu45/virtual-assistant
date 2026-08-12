@@ -308,6 +308,10 @@
         hideTyping();
         if (data.transcript) addBubble(data.transcript, 'user');
         addBubble(data.reply, 'bot');
+        if (data.reply_audio) {
+          const audio = new Audio('data:audio/wav;base64,' + data.reply_audio);
+          audio.play();
+        }
       } catch (error) {
         hideTyping();
         addBubble("Sorry, I couldn't process that voice message.", 'bot');
