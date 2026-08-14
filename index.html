@@ -200,6 +200,20 @@
     bubble.textContent = text;
     messagesEl.appendChild(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    function addVideoBubble(videoUrl) {
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble bot';
+    bubble.style.padding = '6px';
+    const video = document.createElement('video');
+    video.src = videoUrl;
+    video.controls = true;
+    video.style.maxWidth = '100%';
+    video.style.borderRadius = '10px';
+    bubble.appendChild(video);
+    messagesEl.appendChild(bubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
   }
 
   function showTyping() {
@@ -248,6 +262,9 @@
       const data = await response.json();
       hideTyping();
       addBubble(data.reply, 'bot');
+      if (data.video_url) {
+        addVideoBubble(data.video_url);
+      }
     } catch (error) {
       hideTyping();
       addBubble("Sorry, I couldn't connect right now.", 'bot');

@@ -41,6 +41,9 @@ ASSISTANT_NAME = SETTINGS["assistant_name"]
 GREETING = SETTINGS["greeting"]
 FAQ = SETTINGS["faq"]
 
+with open("products.json", "r", encoding="utf-8") as f:
+    PRODUCTS = json.load(f)
+
 BASE_SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, built by Jawad — not by Google or any other company. "
     f"If asked who made you, who you work for, or what you are, always say you were built by Jawad. "
@@ -59,6 +62,15 @@ def lookup_faq(question: str) -> str:
         if key in question:
             return FAQ[key]
     return "I don't have a saved answer for that."
+
+def find_product_video(message: str):
+    """Checks a message for product keywords and returns the matching video filename, if any."""
+    message = message.lower().strip()
+    for product in PRODUCTS:
+        for keyword in product["keywords"]:
+            if keyword.lower() in message:
+                return product["video_file"]
+    return None
 
 def get_weather(city: str) -> str:
     """Gets the current weather for a given city name."""
@@ -159,6 +171,9 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
     try:
         reply = generate_reply(request.message)
+        video_file = find_product_video(request.message)
+        if video_file:
+            return {"reply": reply, "video_url": f"/videos/{video_file}"}
         return {"reply": reply}
     except Exception as e:
         logger.error(f"Error during chat: {e}")
