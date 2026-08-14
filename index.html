@@ -309,9 +309,17 @@
         if (data.transcript) addBubble(data.transcript, 'user');
         addBubble(data.reply, 'bot');
         if (data.reply_audio) {
-          const audio = new Audio('data:audio/wav;base64,' + data.reply_audio);
-          audio.play();
-        }
+  const binary = atob(data.reply_audio);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  const audioUrl = URL.createObjectURL(blob);
+  const audio = new Audio(audioUrl);
+  audio.play();
+}
+        
       } catch (error) {
         hideTyping();
         addBubble("Sorry, I couldn't process that voice message.", 'bot');
