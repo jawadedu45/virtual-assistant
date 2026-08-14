@@ -200,8 +200,9 @@
     bubble.textContent = text;
     messagesEl.appendChild(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 
-    function addVideoBubble(videoUrl) {
+  function addVideoBubble(videoUrl) {
     const bubble = document.createElement('div');
     bubble.className = 'bubble bot';
     bubble.style.padding = '6px';
@@ -213,7 +214,6 @@
     bubble.appendChild(video);
     messagesEl.appendChild(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
   }
 
   function showTyping() {
