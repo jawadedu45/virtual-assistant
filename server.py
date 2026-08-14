@@ -14,6 +14,8 @@ import os
 import json
 import logging
 import base64
+import wave
+import io
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -129,31 +131,16 @@ def text_to_speech(text: str) -> str:
         )
     )
     audio_data = response.candidates[0].content.parts[0].inline_data.data
-    return base64.b64encode(audio_data).decode("utf-8")
-    def text_to_speech(text: str) -> str:
-        response = client.models.generate_content(
-        model="gemini-3.1-flash-tts-preview",
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
-                )
-            ),
-        )
-    )
-    audio_data = response.candidates[0].content.parts[0].inline_data.data
-    return base64.b64encode(audio_data).decode("utf-8")
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=message,
-        config=types.GenerateContentConfig(
-            system_instruction=full_system_prompt,
-            tools=[get_today_date, lookup_faq, get_weather]
-        )
-    )
-    return response.text
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(audio_data)
+
+    wav_bytes = buffer.getvalue()
+    return base64.b64encode(wav_bytes).decode("utf-8")
 
 @app.post("/chat")
 def chat(request: ChatRequest, x_api_key: str = Header(None)):
