@@ -43,6 +43,10 @@ FAQ = SETTINGS["faq"]
 
 with open("products.json", "r", encoding="utf-8") as f:
     PRODUCTS = json.load(f)
+    analytics = {
+    "total_conversations": 0,
+    "question_counts": {}
+}
 
 BASE_SYSTEM_PROMPT = (
     f"You are {ASSISTANT_NAME}, built by Jawad — not by Google or any other company. "
@@ -111,6 +115,16 @@ def read_root():
 @app.get("/settings")
 def get_settings():
     return {"assistant_name": ASSISTANT_NAME, "greeting": GREETING}
+@app.get("/analytics")
+def get_analytics(x_api_key: str = Header(None)):
+    if x_api_key != APP_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    top_questions = sorted(analytics["question_counts"].items(), key=lambda x: x[1], reverse=True)[:10]
+    return {
+        "total_conversations": analytics["total_conversations"],
+        "top_questions": top_questions
+    }
 def generate_reply(message: str) -> str:
     relevant_chunk = search_document(message)
     full_system_prompt = (
@@ -162,6 +176,8 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
     logger.info(f"Incoming message: {request.message}")
 
     relevant_chunk = search_document(request.message)
+    analytics["total_conversations"] += 1
+    analytics["question_counts"][request.message] = analytics["question_counts"].get(request.message, 0) + 1
 
     full_system_prompt = (
         f"{BASE_SYSTEM_PROMPT}\n\n"
