@@ -345,8 +345,8 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     if memory_context:
         full_system_prompt += f"\n\nWhat you remember about this customer:\n{memory_context}"
 
-    history = build_recent_history(conversation_id) if conversation_id else []
-    contents = history + [types.Content(role="user", parts=[types.Part(text=message)])] if history else message
+        history = build_recent_history(conversation_id) if conversation_id else []
+    contents = history if history else message
 
     response = client.models.generate_content(
         model="gemini-3.5-flash",
