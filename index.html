@@ -251,15 +251,47 @@
     if (typing) typing.remove();
   }
 
+  let GREETING_TEXT = "Hey! I'm Jawad's assistant. What can I help with?";
+
   async function loadSettings() {
     try {
       const response = await fetch('/settings');
       const data = await response.json();
       nameEl.textContent = data.assistant_name;
-      messagesEl.innerHTML = '';
-      addBubble(data.greeting, 'bot');
+      GREETING_TEXT = data.greeting;
     } catch (error) {
       console.error('Could not load settings:', error);
+    }
+    await restoreConversation();
+  }
+
+  // On page load, if this browser already has a conversation, pull its
+  // past messages back from the database and render them, so refreshing
+  // the page doesn't look like everything was forgotten. Falls back to
+  // the greeting if there's no history yet (or the fetch fails).
+  async function restoreConversation() {
+    if (!conversationId) {
+      messagesEl.innerHTML = '';
+      addBubble(GREETING_TEXT, 'bot');
+      return;
+    }
+    try {
+      const response = await fetch(`/conversations/${conversationId}/messages?user_id=${USER_ID}`);
+      if (!response.ok) throw new Error('history fetch failed');
+      const messages = await response.json();
+      if (!messages || messages.length === 0) {
+        messagesEl.innerHTML = '';
+        addBubble(GREETING_TEXT, 'bot');
+        return;
+      }
+      messagesEl.innerHTML = '';
+      for (const m of messages) {
+        addBubble(m.message, m.sender === 'user' ? 'user' : 'bot');
+      }
+    } catch (error) {
+      console.error('Could not load conversation history:', error);
+      messagesEl.innerHTML = '';
+      addBubble(GREETING_TEXT, 'bot');
     }
   }
 
