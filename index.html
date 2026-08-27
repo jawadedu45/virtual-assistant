@@ -194,6 +194,27 @@
   let audioChunks = [];
   let isRecording = false;
 
+  // Identify this customer across visits, and keep them on the same
+  // conversation thread so the assistant remembers context. Both are
+  // just random IDs stored in this browser — no personal info in them.
+  function getOrCreateId(key) {
+    let id = localStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(key, id);
+    }
+    return id;
+  }
+  const USER_ID = getOrCreateId('khyber_user_id');
+  let conversationId = localStorage.getItem('khyber_conversation_id') || null;
+
+  function setConversationId(id) {
+    if (id && id !== conversationId) {
+      conversationId = id;
+      localStorage.setItem('khyber_conversation_id', id);
+    }
+  }
+
   function addBubble(text, sender) {
     const bubble = document.createElement('div');
     bubble.className = 'bubble ' + sender;
@@ -257,10 +278,11 @@
     'Content-Type': 'application/json',
     'X-API-Key': API_KEY
   },
-  body: JSON.stringify({ message: text })
+  body: JSON.stringify({ message: text, user_id: USER_ID, conversation_id: conversationId })
 });
       const data = await response.json();
       hideTyping();
+      setConversationId(data.conversation_id);
       addBubble(data.reply, 'bot');
       if (data.video_url) {
         addVideoBubble(data.video_url);
@@ -319,10 +341,11 @@
             'Content-Type': 'application/json',
             'X-API-Key': API_KEY
           },
-          body: JSON.stringify({ audio_base64: base64Audio, mime_type: 'audio/webm' })
+          body: JSON.stringify({ audio_base64: base64Audio, mime_type: 'audio/webm', user_id: USER_ID, conversation_id: conversationId })
         });
         const data = await response.json();
         hideTyping();
+        setConversationId(data.conversation_id);
         if (data.transcript) addBubble(data.transcript, 'user');
         addBubble(data.reply, 'bot');
         if (data.reply_audio) {
