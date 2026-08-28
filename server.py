@@ -345,7 +345,11 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     if memory_context:
         full_system_prompt += f"\n\nWhat you remember about this customer:\n{memory_context}"
 
-        history = build_recent_history(conversation_id) if conversation_id else []
+    # The current message was already saved to the DB before this function
+    # was called, so build_recent_history() already includes it as the
+    # final entry. Don't append it again — that would create two
+    # consecutive "user" turns and break Gemini's alternating-turn history.
+    history = build_recent_history(conversation_id) if conversation_id else []
     contents = history if history else message
 
     response = client.models.generate_content(
@@ -575,6 +579,33 @@ def admin_list_all_conversations(x_api_key: str = Header(None), limit: int = Que
                WHERE c.is_deleted = 0
                ORDER BY c.updated_at DESC LIMIT ?""",
             (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.get("/admin/conversations/{conversation_id}/messages")
+def admin_get_conversation_messages(conversation_id: str, x_api_key: str = Header(None),
+                                     limit: int = Query(200, le=500)):
+    """Same as /conversations/{id}/messages but for admins: no ownership
+    check, since an admin should be able to view any of their business's
+    customer conversations."""
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    convo = db.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return db.get_messages_page(conversation_id, limit=limit)
+
+
+@app.get("/admin/customers")
+def admin_list_customers(x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM customers ORDER BY updated_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
