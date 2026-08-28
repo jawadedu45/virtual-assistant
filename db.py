@@ -1,18 +1,25 @@
 """
 db.py — persistent storage layer for the assistant.
 
-Uses SQLite (stdlib, zero extra dependencies). One file: assistant.db,
-created automatically on first run. Designed so every table is scoped
-by business_id, so this can support multiple businesses later without
-schema changes — for now everything uses business_id = "default".
+Uses Turso via the `turso_serverless` package — a pure HTTP driver
+purpose-built for stateless serverless environments like Vercel (no
+local file involved at all, unlike the `libsql` package which expects
+a local file that optionally syncs). This is what makes data survive
+Vercel's ephemeral, no-persistent-disk serverless functions.
 
-If you ever outgrow SQLite (many concurrent businesses, high write
-volume), you can swap this module for a Postgres-backed one and keep
-the same function signatures — the rest of the app doesn't need to change.
+Requires two environment variables (set in .env locally, and in your
+Vercel project's Environment Variables in production):
+  TURSO_DATABASE_URL   e.g. libsql://your-db-yourname.aws-ap-south-1.turso.io
+  TURSO_AUTH_TOKEN     the token generated in the Turso dashboard
+
+Every table is scoped by business_id, so this can support multiple
+businesses later without schema changes — for now everything uses
+business_id = "default".
 """
 
-import sqlite3
+import turso_serverless
 import json
+import os
 import uuid
 import logging
 from contextlib import contextmanager
@@ -20,7 +27,6 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "assistant.db"
 DEFAULT_BUSINESS_ID = "default"
 
 
@@ -30,25 +36,37 @@ def _now() -> str:
 
 @contextmanager
 def get_conn():
-    """Yields a SQLite connection with row access by column name.
-    Raises a clear error the caller can catch if the DB file is unavailable
-    (e.g. disk full, permissions issue) instead of crashing the whole app.
-    """
+    """Yields a connection to the Turso database over HTTP. Raises a
+    clear error the caller can catch if the database is unavailable
+    (bad credentials, network issue) instead of crashing the whole app.
+    Rows returned by conn.execute(...).fetchone()/.fetchall() behave
+    like sqlite3.Row — support both row["col"] and dict(row)."""
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+        url = os.environ.get("TURSO_DATABASE_URL")
+        token = os.environ.get("TURSO_AUTH_TOKEN")
+        if not url or not token:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are not set. "
+                "Add them to .env (local) or your host's environment variables (production)."
+            )
+        conn = turso_serverless.connect(url, auth_token=token)
         yield conn
         conn.commit()
-    except sqlite3.Error as e:
+    except Exception as e:
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         logger.error(f"Database error: {e}")
         raise
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def init_db():
