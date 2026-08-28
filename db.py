@@ -51,6 +51,7 @@ def get_conn():
                 "Add them to .env (local) or your host's environment variables (production)."
             )
         conn = turso_serverless.connect(url, auth_token=token)
+        conn.row_factory = turso_serverless.Row  # without this, rows come back as plain tuples
         yield conn
         conn.commit()
     except Exception as e:
