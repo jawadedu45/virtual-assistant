@@ -162,12 +162,13 @@
 <body>
 
 <div class="chat-widget">
-  <div class="chat-header">
+    <div class="chat-header">
     <img src="logo.png" class="avatar" style="object-fit: cover;">
-<div>
+<div style="flex:1;">
   <h1>Khyber AI</h1>
   <p>Usually replies instantly</p>
 </div>
+<button id="new-chat-btn" title="Start a new conversation" style="background:transparent; border:1px solid rgba(255,255,255,0.3); color:#fff; border-radius:14px; padding:5px 12px; font-size:12px; cursor:pointer; font-family:'Inter',sans-serif;">New Chat</button>
   </div>
 
   <div class="chat-messages" id="chat-messages">
@@ -399,8 +400,18 @@
     };
   }
 
-  loadSettings();
-</script>
+    // Lets the customer explicitly start a new conversation, per spec:
+  // memory/history should only ever be cleared on purpose, never automatically.
+  document.getElementById('new-chat-btn').addEventListener('click', async () => {
+    try {
+      const response = await fetch(`/conversations?user_id=${USER_ID}`, { method: 'POST' });
+      const data = await response.json();
+      setConversationId(data.conversation_id);
+      messagesEl.innerHTML = '';
+      addBubble(GREETING_TEXT, 'bot');
+    } catch (error) {
+      console.error('Could not start a new conversation:', error);
+    }
+  });
 
-</body>
-</html>
+  loadSettings();

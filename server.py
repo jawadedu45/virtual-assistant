@@ -29,7 +29,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://virtual-assistant-pi-seven.vercel.app",
+        "http://localhost:8000",  # for local testing
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -423,10 +426,16 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist reply: {e}")
 
-    video_file = find_product_video(request.message)
+        video_file = find_product_video(request.message)
     result = {"reply": reply, "conversation_id": conversation_id}
     if video_file:
-        result["video_url"] = f"/videos/{video_file}"
+        video_url = f"/videos/{video_file}"
+        result["video_url"] = video_url
+        if DB_AVAILABLE and conversation_id:
+            try:
+                db.save_message(conversation_id, "assistant", video_url, "video")
+            except Exception as e:
+                logger.error(f"Could not persist video message: {e}")
     return result
 
 
