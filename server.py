@@ -336,6 +336,16 @@ def get_analytics(x_api_key: str = Header(None)):
     }
 
 
+# Maps each tool name Gemini can call to the actual Python function that
+# runs it. Used by the manual function-calling loop below.
+TOOL_FUNCTIONS = {
+    "get_today_date": get_today_date,
+    "lookup_faq": lookup_faq,
+    "get_weather": get_weather,
+    "search_products_tool": search_products_tool,
+}
+
+
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
@@ -348,23 +358,42 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     if memory_context:
         full_system_prompt += f"\n\nWhat you remember about this customer:\n{memory_context}"
 
-    # The current message was already saved to the DB before this function
-    # was called, so build_recent_history() already includes it as the
-    # final entry. Don't append it again — that would create two
-    # consecutive "user" turns and break Gemini's alternating-turn history.
     history = build_recent_history(conversation_id) if conversation_id else []
-    contents = history if history else message
+    contents = list(history) if history else [types.Content(role="user", parts=[types.Part(text=message)])]
 
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=full_system_prompt,
-            tools=[get_today_date, lookup_faq, get_weather, search_products_tool]
-        )
+    config = types.GenerateContentConfig(
+        system_instruction=full_system_prompt,
+        tools=[get_today_date, lookup_faq, get_weather, search_products_tool],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
-    return response.text
 
+    response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+
+    max_turns = 5
+    turns = 0
+    while response.function_calls and turns < max_turns:
+        turns += 1
+        contents.append(response.candidates[0].content)
+
+        function_response_parts = []
+        for fc in response.function_calls:
+            func = TOOL_FUNCTIONS.get(fc.name)
+            if func:
+                try:
+                    result = func(**(fc.args or {}))
+                except Exception as e:
+                    logger.error(f"Tool '{fc.name}' failed: {e}")
+                    result = f"Error running {fc.name}: {e}"
+            else:
+                result = f"Unknown tool: {fc.name}"
+            function_response_parts.append(
+                types.Part.from_function_response(name=fc.name, response={"result": result})
+            )
+        contents.append(types.Content(role="user", parts=function_response_parts))
+
+        response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+
+    return response.text
 
 def text_to_speech(text: str) -> str:
     response = client.models.generate_content(
