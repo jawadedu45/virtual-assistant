@@ -654,12 +654,23 @@ def admin_list_customers(x_api_key: str = Header(None)):
 # otherwise it can override them.
 @app.get("/index.html")
 def serve_widget():
-    return FileResponse("index.html")
+    return FileResponse("index.html", headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 @app.get("/")
 def serve_widget_root():
-    return FileResponse("index.html")
+    return FileResponse("index.html", headers={"Cache-Control": "no-store, must-revalidate"})
+
+
+# Explicit route for app.js with caching fully disabled. Without this,
+# Vercel's global edge network can serve a stale/inconsistent cached copy
+# from a different edge location right after a deploy — which is exactly
+# what caused the chat to intermittently fail to load until the edge
+# cache fully synced. "no-store" forces every request straight to origin.
+@app.get("/app.js")
+def serve_app_js():
+    return FileResponse("app.js", media_type="text/javascript",
+                         headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 # Serves any other files sitting in the same folder (CSS, JS, images)
