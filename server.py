@@ -51,9 +51,10 @@ FAQ = SETTINGS["faq"]
 # Creates assistant.db (SQLite) on first run and migrates any existing
 # products.json into it. Safe to call on every startup.
 try:
-    db.init_db()
-    db.migrate_products_from_json("products.json")
-    DB_AVAILABLE = True
+  db.init_db()
+  db.migrate_v2_sales_agent()
+  db.migrate_products_from_json("products.json")
+  DB_AVAILABLE = True
 except Exception as e:
     logger.error(f"Database unavailable at startup: {e}")
     DB_AVAILABLE = False

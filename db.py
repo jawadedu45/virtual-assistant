@@ -150,6 +150,91 @@ def init_db():
     logger.info("Database initialized.")
 
 
+def _add_column_if_missing(conn, table: str, column: str, definition: str):
+    """SQLite/libSQL doesn't support 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS',
+    so we just try the ALTER and swallow the error if the column already
+    exists. Makes migrations safe to run on every startup."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    except Exception as e:
+        if "duplicate column" not in str(e).lower():
+            logger.error(f"Unexpected error adding column {table}.{column}: {e}")
+
+
+def migrate_v2_sales_agent():
+    """Adds everything needed for the AI Sales Agent upgrade: richer
+    product data, customer profiling (language/budget/lead scoring),
+    per-business customization (name/personality/instructions), orders,
+    and manager notifications. Purely additive — existing rows and
+    columns are untouched, so this is safe to run on every startup."""
+    with get_conn() as conn:
+        # --- products: discount, multiple images/videos, brand ---
+        _add_column_if_missing(conn, "products", "discount_price", "REAL")
+        _add_column_if_missing(conn, "products", "images", "TEXT")   # JSON array string
+        _add_column_if_missing(conn, "products", "videos", "TEXT")   # JSON array string
+        _add_column_if_missing(conn, "products", "brand", "TEXT")
+
+        # --- customers: profiling for sales intelligence ---
+        _add_column_if_missing(conn, "customers", "language_preference", "TEXT")
+        _add_column_if_missing(conn, "customers", "budget_min", "REAL")
+        _add_column_if_missing(conn, "customers", "budget_max", "REAL")
+        _add_column_if_missing(conn, "customers", "lead_score", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "customers", "lead_status", "TEXT DEFAULT 'new'")
+        _add_column_if_missing(conn, "customers", "interests", "TEXT")
+
+        # --- conversations: human handoff support ---
+        _add_column_if_missing(conn, "conversations", "mode", "TEXT DEFAULT 'ai'")
+        _add_column_if_missing(conn, "conversations", "requires_human", "INTEGER DEFAULT 0")
+
+        # --- businesses: customizable identity + sales personality ---
+        _add_column_if_missing(conn, "businesses", "ai_name", "TEXT")
+        _add_column_if_missing(conn, "businesses", "logo_url", "TEXT")
+        _add_column_if_missing(conn, "businesses", "personality", "TEXT DEFAULT 'friendly'")
+        _add_column_if_missing(conn, "businesses", "custom_instructions", "TEXT")
+        _add_column_if_missing(conn, "businesses", "supported_languages", "TEXT DEFAULT 'en,ur,ps'")
+        _add_column_if_missing(conn, "businesses", "notifications_enabled", "INTEGER DEFAULT 1")
+        _add_column_if_missing(conn, "businesses", "follow_up_enabled", "INTEGER DEFAULT 0")
+
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            business_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT,
+            product_id TEXT,
+            product_name TEXT,
+            color TEXT,
+            size TEXT,
+            quantity INTEGER DEFAULT 1,
+            price REAL,
+            status TEXT DEFAULT 'order_pending',
+            customer_name TEXT,
+            customer_phone TEXT,
+            delivery_address TEXT,
+            payment_method TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS notifications (
+            notification_id TEXT PRIMARY KEY,
+            business_id TEXT NOT NULL,
+            user_id TEXT,
+            conversation_id TEXT,
+            priority TEXT NOT NULL,   -- 'hot' | 'warm' | 'new' | 'human_help'
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            product_id TEXT,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_orders_business ON orders(business_id, status);
+        CREATE INDEX IF NOT EXISTS idx_notifications_business ON notifications(business_id, is_read, created_at);
+        """)
+    logger.info("Sales-agent schema migration (v2) applied.")
+
+
 def migrate_products_from_json(json_path: str, business_id: str = DEFAULT_BUSINESS_ID):
     """One-time migration: if the products table is empty, load
     products.json into it so nothing is lost. Safe to call every
@@ -417,8 +502,9 @@ def add_product(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
             """INSERT INTO products
                (product_id, business_id, product_name, category, description,
                 price, currency, color, size, stock, image_url, video_url,
-                keywords, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                keywords, discount_price, images, videos, brand,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 product_id, business_id,
                 fields.get("product_name", "Unnamed product"),
@@ -427,6 +513,8 @@ def add_product(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
                 fields.get("color"), fields.get("size"),
                 fields.get("stock", 0), fields.get("image_url"),
                 fields.get("video_url"), fields.get("keywords", ""),
+                fields.get("discount_price"), fields.get("images"),
+                fields.get("videos"), fields.get("brand"),
                 _now(), _now(),
             )
         )
@@ -437,7 +525,8 @@ def update_product(product_id: str, **fields) -> bool:
     if not fields:
         return False
     allowed = {"product_name", "category", "description", "price", "currency",
-               "color", "size", "stock", "image_url", "video_url", "keywords"}
+               "color", "size", "stock", "image_url", "video_url", "keywords",
+               "discount_price", "images", "videos", "brand"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
@@ -454,4 +543,249 @@ def update_product(product_id: str, **fields) -> bool:
 def delete_product(product_id: str) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM products WHERE product_id = ?", (product_id,))
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Business settings (customizable AI name, personality, instructions, langs)
+# ---------------------------------------------------------------------------
+
+def get_business_settings(business_id: str = DEFAULT_BUSINESS_ID) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM businesses WHERE business_id = ?", (business_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_business_settings(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> bool:
+    allowed = {"ai_name", "logo_url", "personality", "custom_instructions",
+               "supported_languages", "notifications_enabled", "follow_up_enabled", "name"}
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    params = list(updates.values()) + [_now(), business_id]
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE businesses SET {set_clause}, updated_at = ? WHERE business_id = ?",
+            params
+        )
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Customer profiling & lead scoring
+# ---------------------------------------------------------------------------
+
+def update_customer_profile(user_id: str, **fields) -> bool:
+    """Updates whichever profiling fields are provided — language, budget,
+    interests, name/email/phone. Only touches fields actually passed in."""
+    allowed = {"name", "email", "phone", "language_preference",
+               "budget_min", "budget_max", "interests"}
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    params = list(updates.values()) + [_now(), user_id]
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE customers SET {set_clause}, updated_at = ? WHERE user_id = ?",
+            params
+        )
+        return cur.rowcount > 0
+
+
+def get_customer(user_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM customers WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+LEAD_STATUS_THRESHOLDS = [
+    (81, "hot"),
+    (61, "warm"),
+    (31, "interested"),
+    (0, "new"),
+]
+
+
+def _lead_status_for_score(score: int) -> str:
+    for threshold, status in LEAD_STATUS_THRESHOLDS:
+        if score >= threshold:
+            return status
+    return "new"
+
+
+def adjust_lead_score(user_id: str, delta: int, business_id: str = DEFAULT_BUSINESS_ID) -> int:
+    """Increases (or decreases) a customer's lead score by delta, clamped
+    to 0-100, and updates their lead_status to match. Returns the new score.
+    Safe to call even if the customer doesn't exist yet (creates them)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT lead_score FROM customers WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            get_or_create_customer(user_id, business_id)
+            current = 0
+        else:
+            current = row["lead_score"] or 0
+
+        new_score = max(0, min(100, current + delta))
+        new_status = _lead_status_for_score(new_score)
+
+        conn.execute(
+            "UPDATE customers SET lead_score = ?, lead_status = ?, updated_at = ? WHERE user_id = ?",
+            (new_score, new_status, _now(), user_id)
+        )
+        return new_score
+
+
+def list_leads(business_id: str = DEFAULT_BUSINESS_ID, status: str = None,
+                limit: int = 50, offset: int = 0) -> list[dict]:
+    """Customers ordered by lead score, optionally filtered by status
+    (new/interested/warm/hot), for the manager dashboard's Leads view."""
+    query = "SELECT * FROM customers WHERE business_id = ?"
+    params = [business_id]
+    if status:
+        query += " AND lead_status = ?"
+        params.append(status)
+    query += " ORDER BY lead_score DESC, updated_at DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------
+
+ORDER_STATUSES = [
+    "new_lead", "interested", "product_recommended", "added_to_cart",
+    "order_pending", "order_confirmed", "manager_review_required",
+    "processing", "shipped", "delivered", "cancelled",
+]
+
+
+def create_order(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
+    order_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO orders
+               (order_id, business_id, user_id, conversation_id, product_id,
+                product_name, color, size, quantity, price, status,
+                customer_name, customer_phone, delivery_address, payment_method,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                order_id, business_id,
+                fields.get("user_id"), fields.get("conversation_id"),
+                fields.get("product_id"), fields.get("product_name"),
+                fields.get("color"), fields.get("size"),
+                fields.get("quantity", 1), fields.get("price"),
+                fields.get("status", "order_pending"),
+                fields.get("customer_name"), fields.get("customer_phone"),
+                fields.get("delivery_address"), fields.get("payment_method"),
+                _now(), _now(),
+            )
+        )
+    return order_id
+
+
+def update_order_status(order_id: str, status: str) -> bool:
+    if status not in ORDER_STATUSES:
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE orders SET status = ?, updated_at = ? WHERE order_id = ?",
+            (status, _now(), order_id)
+        )
+        return cur.rowcount > 0
+
+
+def list_orders(business_id: str = DEFAULT_BUSINESS_ID, status: str = None,
+                 limit: int = 50, offset: int = 0) -> list[dict]:
+    query = "SELECT * FROM orders WHERE business_id = ?"
+    params = [business_id]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Manager notifications
+# ---------------------------------------------------------------------------
+
+def create_notification(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
+    notification_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO notifications
+               (notification_id, business_id, user_id, conversation_id,
+                priority, title, message, product_id, is_read, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+            (
+                notification_id, business_id,
+                fields.get("user_id"), fields.get("conversation_id"),
+                fields.get("priority", "new"), fields.get("title", ""),
+                fields.get("message", ""), fields.get("product_id"),
+                _now(),
+            )
+        )
+    return notification_id
+
+
+def list_notifications(business_id: str = DEFAULT_BUSINESS_ID, unread_only: bool = False,
+                        limit: int = 50) -> list[dict]:
+    query = "SELECT * FROM notifications WHERE business_id = ?"
+    params = [business_id]
+    if unread_only:
+        query += " AND is_read = 0"
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_notification_read(notification_id: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE notification_id = ?",
+            (notification_id,)
+        )
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Human handoff
+# ---------------------------------------------------------------------------
+
+def set_conversation_mode(conversation_id: str, mode: str) -> bool:
+    """mode is 'ai' or 'human'. When 'human', the AI should stop
+    auto-replying until a manager sets it back to 'ai'."""
+    if mode not in ("ai", "human"):
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET mode = ?, updated_at = ? WHERE conversation_id = ?",
+            (mode, _now(), conversation_id)
+        )
+        return cur.rowcount > 0
+
+
+def flag_requires_human(conversation_id: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET requires_human = 1, updated_at = ? WHERE conversation_id = ?",
+            (_now(), conversation_id)
+        )
         return cur.rowcount > 0
