@@ -51,23 +51,84 @@ FAQ = SETTINGS["faq"]
 # Creates assistant.db (SQLite) on first run and migrates any existing
 # products.json into it. Safe to call on every startup.
 try:
-  db.init_db()
-  db.migrate_v2_sales_agent()
-  db.migrate_products_from_json("products.json")
-  DB_AVAILABLE = True
+    db.init_db()
+    db.migrate_v2_sales_agent()
+    db.migrate_products_from_json("products.json")
+    DB_AVAILABLE = True
 except Exception as e:
     logger.error(f"Database unavailable at startup: {e}")
     DB_AVAILABLE = False
 
-BASE_SYSTEM_PROMPT = (
-    f"You are {ASSISTANT_NAME}, built by Jawad — not by Google or any other company. "
-    f"If asked who made you, who you work for, or what you are, always say you were built by Jawad. "
-    f"Keep replies short, casual, and natural — like a normal conversation, not a formal AI response. "
-    f"Detect the language the user writes in — English, Urdu, or Pashto — and always reply in that same language. "
-    f"You can look up products in the store catalog using the search_products tool when the customer is "
-    f"asking about items, prices, or availability. Only mention products that come back from that tool — "
-    f"never invent products, prices, or stock levels."
-)
+PERSONALITY_STYLES = {
+    "friendly": "warm, approachable, and easygoing — like chatting with a helpful friend who happens to work at the store",
+    "professional": "polished, courteous, and efficient — clear and to the point, like a knowledgeable retail associate",
+    "luxury": "refined, attentive, and a little indulgent — the tone of a high-end boutique consultant who makes the customer feel valued",
+    "energetic": "upbeat, enthusiastic, and quick to get excited about products — lots of positive energy without being over the top",
+    "simple": "plain, direct, and easy to follow — short sentences, no jargon, no fluff",
+    "persuasive": "confident and compelling — skilled at highlighting value and gently guiding the customer toward a decision",
+}
+
+
+def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
+    """Builds the live system prompt from the business's current settings
+    in the database (name, personality, custom instructions, supported
+    languages) — read fresh on every request so changes the owner makes
+    in admin.html take effect immediately, no redeploy needed."""
+    biz = db.get_business_settings() if DB_AVAILABLE else None
+
+    ai_name = (biz and biz.get("ai_name")) or ASSISTANT_NAME
+    business_name = (biz and biz.get("name")) or ASSISTANT_NAME
+    personality_key = (biz and biz.get("personality")) or "friendly"
+    personality_desc = PERSONALITY_STYLES.get(personality_key, PERSONALITY_STYLES["friendly"])
+    custom_instructions = (biz and biz.get("custom_instructions")) or ""
+    supported_languages = (biz and biz.get("supported_languages")) or "en,ur,ps"
+    lang_names = {"en": "English", "ur": "Urdu", "ps": "Pashto"}
+    languages_list = ", ".join(lang_names.get(code.strip(), code.strip())
+                                for code in supported_languages.split(",") if code.strip())
+
+    prompt = (
+        f"You are {ai_name}, an AI sales assistant for {business_name}, built by Jawad — "
+        f"not by Google or any other company. If asked who made you, who you work for, or "
+        f"what you are, always say you were built by Jawad.\n\n"
+
+        f"PERSONALITY: Your tone is {personality_desc}.\n\n"
+
+        f"LANGUAGE: You support {languages_list}. Detect the language the customer writes in "
+        f"and reply naturally in that same language — like a fluent native speaker having a "
+        f"real conversation, never a stiff or literal translation. Match their tone.\n\n"
+
+        f"YOUR JOB: You are not a search engine — you are a skilled, experienced salesperson. "
+        f"Understand what the customer actually wants, ask smart follow-up questions when "
+        f"something important is missing (budget, size, color, occasion), and don't ask about "
+        f"things they've already told you. When you recommend products, explain *why* they're "
+        f"a good fit, not just list them — mention color, size, price, any discount, and stock "
+        f"availability naturally in the conversation. If more than one product fits, briefly "
+        f"compare them and give your honest recommendation. If a customer is unsure, hesitant, "
+        f"or raises an objection (too expensive, not sure about color, etc.), address it "
+        f"professionally and helpfully — never pushy, never desperate. Where it genuinely helps "
+        f"the customer, suggest a complementary or upgraded item (upsell/cross-sell), but only "
+        f"when it's a natural fit, not forced into every message.\n\n"
+
+        f"GROUNDING — CRITICAL: You can look up real products using the search_products tool. "
+        f"Only ever mention products, prices, colors, sizes, discounts, or stock levels that "
+        f"actually came back from that tool. Never invent or guess product details. If the "
+        f"customer asks about something not in the catalog or something you're not sure about, "
+        f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
+
+        f"Keep replies natural and conversational — not overly long, not robotic."
+    )
+
+    if custom_instructions:
+        prompt += f"\n\nADDITIONAL INSTRUCTIONS FROM THE BUSINESS OWNER:\n{custom_instructions}"
+
+    prompt += (
+        f"\n\nHere is relevant background information you can use if it helps answer the question:\n"
+        f"\"{relevant_chunk}\""
+    )
+    if memory_context:
+        prompt += f"\n\nWhat you remember about this customer:\n{memory_context}"
+
+    return prompt
 
 
 def get_today_date() -> str:
@@ -98,9 +159,11 @@ def search_products_tool(keyword: str = None, category: str = None,
                           max_price: float = None, min_price: float = None,
                           color: str = None) -> str:
     """Searches the store's product catalog. Use this whenever a customer
-    asks about items, prices, colors, categories, or availability.
-    Returns a JSON list of matching products (name, price, currency, color,
-    size, stock, description) — at most 5 results."""
+    asks about items, prices, colors, categories, availability, discounts,
+    or wants to see product images/videos. Returns a JSON list of matching
+    products (name, price, discount_price if any, currency, color, size,
+    stock, brand, description, whether images/video are available) —
+    at most 5 results."""
     if not DB_AVAILABLE:
         return json.dumps([])
     try:
@@ -114,11 +177,15 @@ def search_products_tool(keyword: str = None, category: str = None,
                 "name": r["product_name"],
                 "category": r["category"],
                 "price": r["price"],
+                "discount_price": r.get("discount_price"),
                 "currency": r["currency"],
                 "color": r["color"],
                 "size": r["size"],
                 "stock": r["stock"],
+                "brand": r.get("brand"),
                 "description": r["description"],
+                "has_image": bool(r.get("image_url") or r.get("images")),
+                "has_video": bool(r.get("video_url") or r.get("videos")),
             }
             for r in results
         ]
@@ -279,6 +346,10 @@ class ProductIn(BaseModel):
     image_url: Optional[str] = None
     video_url: Optional[str] = None
     keywords: Optional[str] = ""
+    discount_price: Optional[float] = None
+    images: Optional[str] = None
+    videos: Optional[str] = None
+    brand: Optional[str] = None
 
 
 class ProductUpdate(BaseModel):
@@ -293,6 +364,21 @@ class ProductUpdate(BaseModel):
     image_url: Optional[str] = None
     video_url: Optional[str] = None
     keywords: Optional[str] = None
+    discount_price: Optional[float] = None
+    images: Optional[str] = None
+    videos: Optional[str] = None
+    brand: Optional[str] = None
+
+
+class BusinessSettingsUpdate(BaseModel):
+    ai_name: Optional[str] = None
+    name: Optional[str] = None
+    logo_url: Optional[str] = None
+    personality: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    supported_languages: Optional[str] = None
+    notifications_enabled: Optional[bool] = None
+    follow_up_enabled: Optional[bool] = None
 
 
 def check_api_key(x_api_key: str):
@@ -318,7 +404,9 @@ def read_root():
 
 @app.get("/settings")
 def get_settings():
-    return {"assistant_name": ASSISTANT_NAME, "greeting": GREETING}
+    biz = db.get_business_settings() if DB_AVAILABLE else None
+    ai_name = (biz and biz.get("ai_name")) or ASSISTANT_NAME
+    return {"assistant_name": ai_name, "greeting": GREETING}
 
 
 @app.get("/analytics")
@@ -350,26 +438,30 @@ TOOL_FUNCTIONS = {
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
+    full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
 
-    full_system_prompt = (
-        f"{BASE_SYSTEM_PROMPT}\n\n"
-        f"Here is relevant background information you can use if it helps answer the question:\n"
-        f"\"{relevant_chunk}\""
-    )
-    if memory_context:
-        full_system_prompt += f"\n\nWhat you remember about this customer:\n{memory_context}"
-
+    # The current message was already saved to the DB before this function
+    # was called, so build_recent_history() already includes it as the
+    # final entry. Don't append it again — that would create two
+    # consecutive "user" turns and break Gemini's alternating-turn history.
     history = build_recent_history(conversation_id) if conversation_id else []
     contents = list(history) if history else [types.Content(role="user", parts=[types.Part(text=message)])]
 
     config = types.GenerateContentConfig(
         system_instruction=full_system_prompt,
         tools=[get_today_date, lookup_faq, get_weather, search_products_tool],
+        # Manual function calling: the SDK's "automatic" mode can sometimes
+        # let the model blend invented details in with real tool results.
+        # Handling calls ourselves guarantees any product fact the AI states
+        # came directly from search_products_tool's real output, not a guess.
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
     response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
 
+    # Run any tool calls ourselves and feed the real results back, looping
+    # in case the model wants to call another tool after seeing the first
+    # result. Capped so a misbehaving model can't loop forever.
     max_turns = 5
     turns = 0
     while response.function_calls and turns < max_turns:
@@ -395,6 +487,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
 
     return response.text
+
 
 def text_to_speech(text: str) -> str:
     response = client.models.generate_content(
@@ -456,7 +549,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist reply: {e}")
 
-        video_file = find_product_video(request.message)
+    video_file = find_product_video(request.message)
     result = {"reply": reply, "conversation_id": conversation_id}
     if video_file:
         video_url = f"/videos/{video_file}"
@@ -647,6 +740,36 @@ def admin_list_customers(x_api_key: str = Header(None)):
             "SELECT * FROM customers ORDER BY updated_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+@app.get("/admin/business-settings")
+def admin_get_business_settings(x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    settings = db.get_business_settings()
+    if not settings:
+        raise HTTPException(status_code=404, detail="Business not found")
+    return settings
+
+
+@app.put("/admin/business-settings")
+def admin_update_business_settings(settings: BusinessSettingsUpdate, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    updates = {k: v for k, v in settings.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+    # SQLite stores booleans as 0/1
+    if "notifications_enabled" in updates:
+        updates["notifications_enabled"] = int(updates["notifications_enabled"])
+    if "follow_up_enabled" in updates:
+        updates["follow_up_enabled"] = int(updates["follow_up_enabled"])
+    ok = db.update_business_settings(**updates)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Update failed")
+    return db.get_business_settings()
 
 
 # --- Serve the chat widget (index.html) ---
