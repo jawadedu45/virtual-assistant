@@ -115,6 +115,15 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"customer asks about something not in the catalog or something you're not sure about, "
         f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
 
+        f"TAKING ORDERS: When a customer wants to buy something, collect the details step by "
+        f"step in natural conversation — don't dump every question at once. You need: the "
+        f"product (confirmed via search_products_tool), color, size, quantity, their name, "
+        f"and phone number (delivery address and payment method too if relevant). Once you "
+        f"have enough, call create_order_tool — this only creates a PENDING order. Then show "
+        f"the customer a clear order summary (product, color, size, quantity, total price) and "
+        f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
+        f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
+
         f"Keep replies natural and conversational — not overly long, not robotic."
     )
 
@@ -425,8 +434,9 @@ def get_analytics(x_api_key: str = Header(None)):
     }
 
 
-# Maps each tool name Gemini can call to the actual Python function that
-# runs it. Used by the manual function-calling loop below.
+# Maps each stateless tool name Gemini can call to the actual Python
+# function that runs it. Order tools are added per-request in
+# generate_reply() since they need to be bound to the current customer.
 TOOL_FUNCTIONS = {
     "get_today_date": get_today_date,
     "lookup_faq": lookup_faq,
@@ -435,10 +445,93 @@ TOOL_FUNCTIONS = {
 }
 
 
+def make_order_tools(user_id: str, conversation_id: str):
+    """Builds create_order_tool and confirm_order_tool bound to the current
+    customer/conversation via closure. They're kept as two separate steps
+    on purpose — creating an order is NOT the same as confirming it — so
+    the AI can show the customer a summary and get explicit agreement
+    before anything is actually placed."""
+
+    def create_order_tool(product_id: str, color: str = None, size: str = None,
+                           quantity: int = 1, customer_name: str = None,
+                           customer_phone: str = None, delivery_address: str = None,
+                           payment_method: str = None) -> str:
+        """Creates a PENDING order once the customer has clearly decided to
+        buy and you've collected the necessary details. ALWAYS get product_id
+        from a prior search_products_tool call — never guess it or its price.
+        Call this once you have at minimum: product_id, color, size, quantity,
+        and the customer's name and phone number. This does NOT confirm the
+        order yet — after calling this, show the customer a clear order
+        summary (product, color, size, quantity, total price) and ask them
+        to confirm. Only call confirm_order_tool after they clearly say yes."""
+        if not DB_AVAILABLE:
+            return json.dumps({"error": "Ordering is temporarily unavailable."})
+        product = db.get_product(product_id)
+        if not product:
+            return json.dumps({"error": "Product not found — search for it again to get a valid product_id."})
+
+        price = product.get("discount_price") or product.get("price")
+        quantity = quantity or 1
+        order_id = db.create_order(
+            user_id=user_id, conversation_id=conversation_id,
+            product_id=product_id, product_name=product["product_name"],
+            color=color or product.get("color"), size=size or product.get("size"),
+            quantity=quantity, price=price,
+            customer_name=customer_name, customer_phone=customer_phone,
+            delivery_address=delivery_address, payment_method=payment_method,
+            status="order_pending",
+        )
+        if customer_name or customer_phone:
+            try:
+                db.update_customer_profile(user_id, name=customer_name, phone=customer_phone)
+            except Exception as e:
+                logger.error(f"Could not update customer profile during order: {e}")
+
+        total_price = (price or 0) * quantity
+        return json.dumps({
+            "order_id": order_id,
+            "product_name": product["product_name"],
+            "color": color or product.get("color"),
+            "size": size or product.get("size"),
+            "quantity": quantity,
+            "unit_price": price,
+            "total_price": total_price,
+            "currency": product.get("currency", "PKR"),
+            "status": "order_pending",
+            "instruction": "Show this as an order summary and ask the customer to confirm. Do not call confirm_order_tool until they explicitly agree."
+        })
+
+    def confirm_order_tool(order_id: str) -> str:
+        """Call this ONLY after the customer has explicitly confirmed the
+        order summary (e.g. said 'yes', 'confirm', 'place the order',
+        'go ahead'). Never call this preemptively — an order must stay
+        pending until the customer clearly agrees."""
+        if not DB_AVAILABLE:
+            return json.dumps({"error": "Ordering is temporarily unavailable."})
+        ok = db.update_order_status(order_id, "order_confirmed")
+        if not ok:
+            return json.dumps({"error": "Could not find that order."})
+        return json.dumps({
+            "order_id": order_id,
+            "status": "order_confirmed",
+            "message": "Order confirmed successfully."
+        })
+
+    return create_order_tool, confirm_order_tool
+
+
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
+
+    # Order tools need to know which customer/conversation they're acting
+    # for, so they're built fresh per-request via closure rather than
+    # living in the static TOOL_FUNCTIONS dict.
+    create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
+    tool_functions = dict(TOOL_FUNCTIONS)
+    tool_functions["create_order_tool"] = create_order_tool
+    tool_functions["confirm_order_tool"] = confirm_order_tool
 
     # The current message was already saved to the DB before this function
     # was called, so build_recent_history() already includes it as the
@@ -449,7 +542,8 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
     config = types.GenerateContentConfig(
         system_instruction=full_system_prompt,
-        tools=[get_today_date, lookup_faq, get_weather, search_products_tool],
+        tools=[get_today_date, lookup_faq, get_weather, search_products_tool,
+               create_order_tool, confirm_order_tool],
         # Manual function calling: the SDK's "automatic" mode can sometimes
         # let the model blend invented details in with real tool results.
         # Handling calls ourselves guarantees any product fact the AI states
@@ -470,7 +564,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
         function_response_parts = []
         for fc in response.function_calls:
-            func = TOOL_FUNCTIONS.get(fc.name)
+            func = tool_functions.get(fc.name)
             if func:
                 try:
                     result = func(**(fc.args or {}))
@@ -770,6 +864,30 @@ def admin_update_business_settings(settings: BusinessSettingsUpdate, x_api_key: 
     if not ok:
         raise HTTPException(status_code=400, detail="Update failed")
     return db.get_business_settings()
+
+
+class OrderStatusUpdate(BaseModel):
+    status: str
+
+
+@app.get("/admin/orders")
+def admin_list_orders(x_api_key: str = Header(None), status: Optional[str] = None,
+                       limit: int = Query(50, le=200)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return db.list_orders(status=status, limit=limit)
+
+
+@app.put("/admin/orders/{order_id}")
+def admin_update_order_status(order_id: str, update: OrderStatusUpdate, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = db.update_order_status(order_id, update.status)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Invalid order_id or status. Valid statuses: {db.ORDER_STATUSES}")
+    return {"updated": True}
 
 
 # --- Serve the chat widget (index.html) ---
