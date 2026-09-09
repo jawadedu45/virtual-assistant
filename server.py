@@ -124,6 +124,13 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
         f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
 
+        f"TRACKING INTEREST: Silently call log_customer_signal_tool whenever the customer's "
+        f"message shows real buying interest — asking the price, asking if something's in "
+        f"stock, asking about delivery, asking about payment methods, or sharing contact info "
+        f"unprompted. This is invisible bookkeeping for the sales team — never mention it to "
+        f"the customer, never let it change your tone, just call it quietly alongside your "
+        f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
+
         f"Keep replies natural and conversational — not overly long, not robotic."
     )
 
@@ -445,6 +452,45 @@ TOOL_FUNCTIONS = {
 }
 
 
+LEAD_SIGNAL_POINTS = {
+    "asked_price": 10,
+    "asked_stock": 10,
+    "asked_delivery": 8,
+    "asked_payment": 8,
+    "provided_contact_info": 15,
+}
+
+
+def make_lead_scoring_tool(user_id: str):
+    """Builds log_customer_signal_tool bound to the current customer. This
+    covers the *soft* interest signals (asking about price/stock/delivery/
+    payment, sharing contact info) — the AI recognizes these naturally in
+    whatever language the customer used, which is far more reliable than
+    keyword-matching across English/Urdu/Pashto. The *hard* signals (order
+    created/confirmed) are scored directly inside the order tools instead,
+    so they're never missed even if the model doesn't call this."""
+
+    def log_customer_signal_tool(signal: str) -> str:
+        """Call this once when the customer's message shows a genuine
+        buying-interest signal — NOT for plain greetings or small talk.
+        Choose exactly one signal that best matches what they just asked:
+        'asked_price' (asking cost/how much), 'asked_stock' (asking if
+        something is available/in stock), 'asked_delivery' (asking about
+        shipping/delivery time), 'asked_payment' (asking about payment
+        methods/COD/cards), or 'provided_contact_info' (shared a phone
+        number, email, or name unprompted, e.g. for a callback)."""
+        if not DB_AVAILABLE or signal not in LEAD_SIGNAL_POINTS:
+            return json.dumps({"ok": False})
+        try:
+            new_score = db.adjust_lead_score(user_id, LEAD_SIGNAL_POINTS[signal])
+            return json.dumps({"ok": True, "signal": signal, "new_score": new_score})
+        except Exception as e:
+            logger.error(f"Lead scoring failed: {e}")
+            return json.dumps({"ok": False})
+
+    return log_customer_signal_tool
+
+
 def make_order_tools(user_id: str, conversation_id: str):
     """Builds create_order_tool and confirm_order_tool bound to the current
     customer/conversation via closure. They're kept as two separate steps
@@ -487,6 +533,14 @@ def make_order_tools(user_id: str, conversation_id: str):
             except Exception as e:
                 logger.error(f"Could not update customer profile during order: {e}")
 
+        # Creating an order is a strong, unambiguous buying signal — score
+        # it directly here rather than relying on the model to also call
+        # log_customer_signal_tool for the same event.
+        try:
+            db.adjust_lead_score(user_id, 20)
+        except Exception as e:
+            logger.error(f"Lead scoring failed on order creation: {e}")
+
         total_price = (price or 0) * quantity
         return json.dumps({
             "order_id": order_id,
@@ -511,6 +565,15 @@ def make_order_tools(user_id: str, conversation_id: str):
         ok = db.update_order_status(order_id, "order_confirmed")
         if not ok:
             return json.dumps({"error": "Could not find that order."})
+
+        # Confirming an order is the strongest possible buying signal —
+        # scored directly and generously here, guaranteed regardless of
+        # whether the model separately calls log_customer_signal_tool.
+        try:
+            db.adjust_lead_score(user_id, 40)
+        except Exception as e:
+            logger.error(f"Lead scoring failed on order confirmation: {e}")
+
         return json.dumps({
             "order_id": order_id,
             "status": "order_confirmed",
@@ -529,9 +592,11 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     # for, so they're built fresh per-request via closure rather than
     # living in the static TOOL_FUNCTIONS dict.
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
+    log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous")
     tool_functions = dict(TOOL_FUNCTIONS)
     tool_functions["create_order_tool"] = create_order_tool
     tool_functions["confirm_order_tool"] = confirm_order_tool
+    tool_functions["log_customer_signal_tool"] = log_customer_signal_tool
 
     # The current message was already saved to the DB before this function
     # was called, so build_recent_history() already includes it as the
@@ -543,7 +608,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     config = types.GenerateContentConfig(
         system_instruction=full_system_prompt,
         tools=[get_today_date, lookup_faq, get_weather, search_products_tool,
-               create_order_tool, confirm_order_tool],
+               create_order_tool, confirm_order_tool, log_customer_signal_tool],
         # Manual function calling: the SDK's "automatic" mode can sometimes
         # let the model blend invented details in with real tool results.
         # Handling calls ourselves guarantees any product fact the AI states
@@ -888,6 +953,17 @@ def admin_update_order_status(order_id: str, update: OrderStatusUpdate, x_api_ke
     if not ok:
         raise HTTPException(status_code=400, detail=f"Invalid order_id or status. Valid statuses: {db.ORDER_STATUSES}")
     return {"updated": True}
+
+
+@app.get("/admin/leads")
+def admin_list_leads(x_api_key: str = Header(None), status: Optional[str] = None,
+                      limit: int = Query(50, le=200)):
+    """Customers ranked by lead score, optionally filtered by status:
+    'new' | 'interested' | 'warm' | 'hot'."""
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return db.list_leads(status=status, limit=limit)
 
 
 # --- Serve the chat widget (index.html) ---
