@@ -210,16 +210,9 @@
 
   // Lets the customer explicitly start a new conversation, per spec:
   // memory/history should only ever be cleared on purpose, never automatically.
-  document.getElementById('new-chat-btn').addEventListener('click', async () => {
-    try {
-      const response = await fetch(`/conversations?user_id=${USER_ID}`, { method: 'POST' });
-      const data = await response.json();
-      setConversationId(data.conversation_id);
-      messagesEl.innerHTML = '';
-      addBubble(GREETING_TEXT, 'bot');
-    } catch (error) {
-      console.error('Could not start a new conversation:', error);
-    }
-  });
+      const response = await fetch(`/conversations?user_id=${USER_ID}`, {
+      method: 'POST',
+      headers: { 'X-API-Key': API_KEY }
+    });
 
   loadSettings();

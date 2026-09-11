@@ -776,14 +776,17 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
 # --- Conversation history endpoints ------------------------------------
 
 @app.get("/conversations")
-def list_user_conversations(user_id: str, limit: int = Query(20, le=100), offset: int = 0):
+def list_user_conversations(user_id: str, x_api_key: str = Header(None),
+                             limit: int = Query(20, le=100), offset: int = 0):
+    check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return db.list_conversations(user_id, limit=limit, offset=offset)
 
 
 @app.post("/conversations")
-def start_conversation(user_id: str, title: Optional[str] = None):
+def start_conversation(user_id: str, x_api_key: str = Header(None), title: Optional[str] = None):
+    check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     db.get_or_create_customer(user_id)
@@ -792,8 +795,9 @@ def start_conversation(user_id: str, title: Optional[str] = None):
 
 
 @app.get("/conversations/{conversation_id}/messages")
-def get_conversation_messages(conversation_id: str, user_id: str,
+def get_conversation_messages(conversation_id: str, user_id: str, x_api_key: str = Header(None),
                                limit: int = Query(50, le=200), offset: int = 0):
+    check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     convo = db.get_conversation(conversation_id)
@@ -803,14 +807,14 @@ def get_conversation_messages(conversation_id: str, user_id: str,
 
 
 @app.delete("/conversations/{conversation_id}")
-def remove_conversation(conversation_id: str, user_id: str):
+def remove_conversation(conversation_id: str, user_id: str, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     ok = db.delete_conversation(conversation_id, user_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"deleted": True}
-
 
 # --- Admin: product management ------------------------------------------
 # Reuses the same shared secret as /analytics for now (single-business
