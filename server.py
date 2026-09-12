@@ -31,7 +31,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://virtual-assistant-pi-seven.vercel.app",
-        "http://localhost:8000",  # for local testing
+        "http://localhost:8000",
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,6 +39,7 @@ app.add_middleware(
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
+CUSTOMER_API_KEY = os.getenv("CUSTOMER_API_KEY")
 
 with open("settings.json", "r", encoding="utf-8") as f:
     SETTINGS = json.load(f)
@@ -47,9 +48,6 @@ ASSISTANT_NAME = SETTINGS["assistant_name"]
 GREETING = SETTINGS["greeting"]
 FAQ = SETTINGS["faq"]
 
-# --- Database setup ---------------------------------------------------
-# Creates assistant.db (SQLite) on first run and migrates any existing
-# products.json into it. Safe to call on every startup.
 try:
     db.init_db()
     db.migrate_v2_sales_agent()
@@ -70,10 +68,6 @@ PERSONALITY_STYLES = {
 
 
 def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
-    """Builds the live system prompt from the business's current settings
-    in the database (name, personality, custom instructions, supported
-    languages) — read fresh on every request so changes the owner makes
-    in admin.html take effect immediately, no redeploy needed."""
     biz = db.get_business_settings() if DB_AVAILABLE else None
 
     ai_name = (biz and biz.get("ai_name")) or ASSISTANT_NAME
@@ -248,9 +242,6 @@ def search_document(question: str) -> str:
 
 
 def build_memory_context(user_id: str) -> str:
-    """Pulls whatever we know about this customer — preferences, notes,
-    and a rolling summary — into a short block of text for the prompt.
-    Keeps this cheap: no raw message history here, just distilled memory."""
     if not DB_AVAILABLE or not user_id:
         return ""
     try:
@@ -271,9 +262,6 @@ def build_memory_context(user_id: str) -> str:
 
 
 def build_recent_history(conversation_id: str):
-    """Returns the last N messages as Gemini Content objects, so the
-    model has short-term context without us re-sending the entire
-    conversation every time."""
     if not DB_AVAILABLE or not conversation_id:
         return []
     try:
@@ -289,14 +277,6 @@ def build_recent_history(conversation_id: str):
 
 
 def maybe_update_memory(user_id: str, conversation_id: str):
-    """Every few messages, distill the conversation into a short rolling
-    summary + preferences and save it to customer_memory. This is how the
-    assistant 'remembers' a customer across separate conversations without
-    us having to resend the full message history every single time.
-
-    Runs only every 6 messages to keep this cheap; safe to fail silently
-    since it's a background enhancement, not core to answering.
-    """
     if not DB_AVAILABLE or not user_id or user_id == "anonymous" or not conversation_id:
         return
     try:
@@ -333,7 +313,6 @@ def maybe_update_memory(user_id: str, conversation_id: str):
             summary=parsed.get("summary"),
         )
     except Exception as e:
-        # Memory updates are a nice-to-have; never let this break the chat.
         logger.error(f"Memory update skipped due to error: {e}")
 
 
@@ -398,13 +377,21 @@ class BusinessSettingsUpdate(BaseModel):
 
 
 def check_api_key(x_api_key: str):
+    """For admin endpoints — the PRIVATE key, never exposed to the browser."""
     if x_api_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def check_customer_api_key(x_api_key: str):
+    """For the public chat widget (/chat, /voice-chat) — the PUBLIC key,
+    intentionally visible in app.js since it's just a light gate, not a
+    real secret. Kept as a separate value from APP_SECRET_KEY so rotating
+    the admin key never breaks the live chat widget."""
+    if x_api_key != CUSTOMER_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 def ensure_conversation(user_id: str, conversation_id: Optional[str]) -> str:
-    """Makes sure we have a valid conversation to write into. Creates a new
-    one if none was given, or if the given one doesn't belong to this user."""
     db.get_or_create_customer(user_id)
     if conversation_id:
         existing = db.get_conversation(conversation_id)
@@ -441,9 +428,6 @@ def get_analytics(x_api_key: str = Header(None)):
     }
 
 
-# Maps each stateless tool name Gemini can call to the actual Python
-# function that runs it. Order tools are added per-request in
-# generate_reply() since they need to be bound to the current customer.
 TOOL_FUNCTIONS = {
     "get_today_date": get_today_date,
     "lookup_faq": lookup_faq,
@@ -462,14 +446,6 @@ LEAD_SIGNAL_POINTS = {
 
 
 def make_lead_scoring_tool(user_id: str):
-    """Builds log_customer_signal_tool bound to the current customer. This
-    covers the *soft* interest signals (asking about price/stock/delivery/
-    payment, sharing contact info) — the AI recognizes these naturally in
-    whatever language the customer used, which is far more reliable than
-    keyword-matching across English/Urdu/Pashto. The *hard* signals (order
-    created/confirmed) are scored directly inside the order tools instead,
-    so they're never missed even if the model doesn't call this."""
-
     def log_customer_signal_tool(signal: str) -> str:
         """Call this once when the customer's message shows a genuine
         buying-interest signal — NOT for plain greetings or small talk.
@@ -492,12 +468,6 @@ def make_lead_scoring_tool(user_id: str):
 
 
 def make_order_tools(user_id: str, conversation_id: str):
-    """Builds create_order_tool and confirm_order_tool bound to the current
-    customer/conversation via closure. They're kept as two separate steps
-    on purpose — creating an order is NOT the same as confirming it — so
-    the AI can show the customer a summary and get explicit agreement
-    before anything is actually placed."""
-
     def create_order_tool(product_id: str, color: str = None, size: str = None,
                            quantity: int = 1, customer_name: str = None,
                            customer_phone: str = None, delivery_address: str = None,
@@ -533,9 +503,6 @@ def make_order_tools(user_id: str, conversation_id: str):
             except Exception as e:
                 logger.error(f"Could not update customer profile during order: {e}")
 
-        # Creating an order is a strong, unambiguous buying signal — score
-        # it directly here rather than relying on the model to also call
-        # log_customer_signal_tool for the same event.
         try:
             db.adjust_lead_score(user_id, 20)
         except Exception as e:
@@ -566,9 +533,6 @@ def make_order_tools(user_id: str, conversation_id: str):
         if not ok:
             return json.dumps({"error": "Could not find that order."})
 
-        # Confirming an order is the strongest possible buying signal —
-        # scored directly and generously here, guaranteed regardless of
-        # whether the model separately calls log_customer_signal_tool.
         try:
             db.adjust_lead_score(user_id, 40)
         except Exception as e:
@@ -588,9 +552,6 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
 
-    # Order tools need to know which customer/conversation they're acting
-    # for, so they're built fresh per-request via closure rather than
-    # living in the static TOOL_FUNCTIONS dict.
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
     log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous")
     tool_functions = dict(TOOL_FUNCTIONS)
@@ -598,10 +559,6 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     tool_functions["confirm_order_tool"] = confirm_order_tool
     tool_functions["log_customer_signal_tool"] = log_customer_signal_tool
 
-    # The current message was already saved to the DB before this function
-    # was called, so build_recent_history() already includes it as the
-    # final entry. Don't append it again — that would create two
-    # consecutive "user" turns and break Gemini's alternating-turn history.
     history = build_recent_history(conversation_id) if conversation_id else []
     contents = list(history) if history else [types.Content(role="user", parts=[types.Part(text=message)])]
 
@@ -609,18 +566,11 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         system_instruction=full_system_prompt,
         tools=[get_today_date, lookup_faq, get_weather, search_products_tool,
                create_order_tool, confirm_order_tool, log_customer_signal_tool],
-        # Manual function calling: the SDK's "automatic" mode can sometimes
-        # let the model blend invented details in with real tool results.
-        # Handling calls ourselves guarantees any product fact the AI states
-        # came directly from search_products_tool's real output, not a guess.
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
     response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
 
-    # Run any tool calls ourselves and feed the real results back, looping
-    # in case the model wants to call another tool after seeing the first
-    # result. Capped so a misbehaving model can't loop forever.
     max_turns = 5
     turns = 0
     while response.function_calls and turns < max_turns:
@@ -676,14 +626,12 @@ def text_to_speech(text: str) -> str:
 
 @app.post("/chat")
 def chat(request: ChatRequest, x_api_key: str = Header(None)):
-    check_api_key(x_api_key)
+    check_customer_api_key(x_api_key)
     logger.info(f"Incoming message: {request.message}")
 
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Fall back to a per-session anonymous id if the frontend didn't send one,
-    # so the app still works even without persistence wired up on that end.
     user_id = request.user_id or "anonymous"
     conversation_id = None
 
@@ -693,7 +641,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
             db.save_message(conversation_id, "user", request.message, "text")
         except Exception as e:
             logger.error(f"Could not persist incoming message: {e}")
-            conversation_id = None  # keep answering even if storage fails
+            conversation_id = None
 
     try:
         reply = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
@@ -723,7 +671,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
 @app.post("/voice-chat")
 def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
-    check_api_key(x_api_key)
+    check_customer_api_key(x_api_key)
 
     user_id = request.user_id or "anonymous"
     conversation_id = None
@@ -773,20 +721,15 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
     return {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
 
 
-# --- Conversation history endpoints ------------------------------------
-
 @app.get("/conversations")
-def list_user_conversations(user_id: str, x_api_key: str = Header(None),
-                             limit: int = Query(20, le=100), offset: int = 0):
-    check_api_key(x_api_key)
+def list_user_conversations(user_id: str, limit: int = Query(20, le=100), offset: int = 0):
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return db.list_conversations(user_id, limit=limit, offset=offset)
 
 
 @app.post("/conversations")
-def start_conversation(user_id: str, x_api_key: str = Header(None), title: Optional[str] = None):
-    check_api_key(x_api_key)
+def start_conversation(user_id: str, title: Optional[str] = None):
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     db.get_or_create_customer(user_id)
@@ -795,9 +738,8 @@ def start_conversation(user_id: str, x_api_key: str = Header(None), title: Optio
 
 
 @app.get("/conversations/{conversation_id}/messages")
-def get_conversation_messages(conversation_id: str, user_id: str, x_api_key: str = Header(None),
+def get_conversation_messages(conversation_id: str, user_id: str,
                                limit: int = Query(50, le=200), offset: int = 0):
-    check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     convo = db.get_conversation(conversation_id)
@@ -807,8 +749,7 @@ def get_conversation_messages(conversation_id: str, user_id: str, x_api_key: str
 
 
 @app.delete("/conversations/{conversation_id}")
-def remove_conversation(conversation_id: str, user_id: str, x_api_key: str = Header(None)):
-    check_api_key(x_api_key)
+def remove_conversation(conversation_id: str, user_id: str):
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     ok = db.delete_conversation(conversation_id, user_id)
@@ -816,10 +757,6 @@ def remove_conversation(conversation_id: str, user_id: str, x_api_key: str = Hea
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"deleted": True}
 
-# --- Admin: product management ------------------------------------------
-# Reuses the same shared secret as /analytics for now (single-business
-# setup). When this becomes multi-business, swap this for per-business
-# admin keys/logins.
 
 @app.get("/admin/products")
 def admin_list_products(x_api_key: str = Header(None)):
@@ -881,9 +818,6 @@ def admin_list_all_conversations(x_api_key: str = Header(None), limit: int = Que
 @app.get("/admin/conversations/{conversation_id}/messages")
 def admin_get_conversation_messages(conversation_id: str, x_api_key: str = Header(None),
                                      limit: int = Query(200, le=500)):
-    """Same as /conversations/{id}/messages but for admins: no ownership
-    check, since an admin should be able to view any of their business's
-    customer conversations."""
     check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -924,7 +858,6 @@ def admin_update_business_settings(settings: BusinessSettingsUpdate, x_api_key: 
     updates = {k: v for k, v in settings.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields provided to update")
-    # SQLite stores booleans as 0/1
     if "notifications_enabled" in updates:
         updates["notifications_enabled"] = int(updates["notifications_enabled"])
     if "follow_up_enabled" in updates:
@@ -962,17 +895,12 @@ def admin_update_order_status(order_id: str, update: OrderStatusUpdate, x_api_ke
 @app.get("/admin/leads")
 def admin_list_leads(x_api_key: str = Header(None), status: Optional[str] = None,
                       limit: int = Query(50, le=200)):
-    """Customers ranked by lead score, optionally filtered by status:
-    'new' | 'interested' | 'warm' | 'hot'."""
     check_api_key(x_api_key)
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return db.list_leads(status=status, limit=limit)
 
 
-# --- Serve the chat widget (index.html) ---
-# This must be registered AFTER all your API routes above,
-# otherwise it can override them.
 @app.get("/index.html")
 def serve_widget():
     return FileResponse("index.html", headers={"Cache-Control": "no-store, must-revalidate"})
@@ -983,17 +911,10 @@ def serve_widget_root():
     return FileResponse("index.html", headers={"Cache-Control": "no-store, must-revalidate"})
 
 
-# Explicit route for app.js with caching fully disabled. Without this,
-# Vercel's global edge network can serve a stale/inconsistent cached copy
-# from a different edge location right after a deploy — which is exactly
-# what caused the chat to intermittently fail to load until the edge
-# cache fully synced. "no-store" forces every request straight to origin.
 @app.get("/app.js")
 def serve_app_js():
     return FileResponse("app.js", media_type="text/javascript",
                          headers={"Cache-Control": "no-store, must-revalidate"})
 
 
-# Serves any other files sitting in the same folder (CSS, JS, images)
-# e.g. a request for /style.css or /widget.js will be found here automatically.
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
