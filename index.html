@@ -46,14 +46,17 @@
     width: 38px;
     height: 38px;
     border-radius: 50%;
-    background: var(--coral);
+    background: #FFFFFF;
     display: flex;
     align-items: center;
     justify-content: center;
     font-family: 'Poppins', sans-serif;
     font-weight: 700;
     font-size: 15px;
+    padding: 4px;
+    flex-shrink: 0;
   }
+  
   .chat-header h1 {
     font-family: 'Poppins', sans-serif;
     font-size: 16px;
@@ -163,7 +166,7 @@
 
 <div class="chat-widget">
   <div class="chat-header">
-    <img src="logo.png" class="avatar" style="object-fit: cover;">
+    <img src="logo.png" class="avatar" style="object-fit: contain;">
 <div style="flex:1;">
   <h1>Khyber AI</h1>
   <p>Usually replies instantly</p>
