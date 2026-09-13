@@ -124,6 +124,12 @@
       const data = await response.json();
       hideTyping();
       setConversationId(data.conversation_id);
+      if (data.handed_off) {
+        // A manager has taken this conversation over — the AI stays quiet,
+        // so we don't show anything here (the human will type separately,
+        // e.g. via the admin panel or another channel).
+        return;
+      }
       addBubble(data.reply, 'bot');
       if (data.video_url) {
         addVideoBubble(data.video_url);
@@ -220,6 +226,15 @@
     } catch (error) {
       console.error('Could not start a new conversation:', error);
     }
+  });
+
+  // Demo mode: quick-tap example messages that show off multilingual
+  // support, product search, video, ordering, and human handoff at a glance.
+  document.querySelectorAll('.demo-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      inputEl.value = chip.dataset.msg;
+      sendMessage();
+    });
   });
 
   loadSettings();

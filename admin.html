@@ -145,6 +145,7 @@
     <button class="tab active" data-tab="products" onclick="switchTab('products')">Products</button>
     <button class="tab" data-tab="leads" onclick="switchTab('leads')">Leads</button>
     <button class="tab" data-tab="orders" onclick="switchTab('orders')">Orders</button>
+    <button class="tab" data-tab="notifications" onclick="switchTab('notifications')">Notifications <span id="notif-badge" style="display:none; background:#c0392b; color:white; border-radius:10px; padding:1px 7px; font-size:11px; margin-left:2px;"></span></button>
     <button class="tab" data-tab="conversations" onclick="switchTab('conversations')">Conversations</button>
     <button class="tab" data-tab="customers" onclick="switchTab('customers')">Customers</button>
     <button class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</button>
@@ -209,10 +210,20 @@
     <div class="empty-note" id="orders-empty" style="display:none;">No orders yet.</div>
   </div>
 
+  <div class="panel" id="panel-notifications">
+    <h3 class="section-title">Notifications</h3>
+    <div class="filter-row" id="notif-filter">
+      <button class="filter-chip active" data-unread="false">All</button>
+      <button class="filter-chip" data-unread="true">Unread only</button>
+    </div>
+    <div id="notifications-list"></div>
+    <div class="empty-note" id="notifications-empty" style="display:none;">No notifications yet.</div>
+  </div>
+
   <div class="panel" id="panel-conversations">
     <h3 class="section-title">Recent conversations</h3>
     <table id="conversations-table">
-      <thead><tr><th>Customer</th><th>Started</th><th>Last activity</th><th></th></tr></thead>
+      <thead><tr><th>Customer</th><th>Started</th><th>Last activity</th><th>Mode</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <div class="empty-note" id="conversations-empty" style="display:none;">No conversations yet.</div>
@@ -221,6 +232,7 @@
       <div id="messages-list"></div>
     </div>
   </div>
+
 
   <div class="panel" id="panel-customers">
     <h3 class="section-title">Customers</h3>
@@ -283,6 +295,7 @@
         loadProducts();
         loadLeads();
         loadOrders();
+        loadNotifications();
         loadConversations();
         loadCustomers();
         loadSettings();
@@ -467,6 +480,58 @@
     loadOrders(e.target.dataset.status);
   });
 
+  // --- Notifications ---
+  const PRIORITY_ICONS = { hot: '🔥', warm: '🟠', new: '🔵', human_help: '⚠️' };
+  let currentNotifFilter = false;
+
+  async function loadNotifications(unreadOnly) {
+    if (unreadOnly !== undefined) currentNotifFilter = unreadOnly;
+    try {
+      const url = currentNotifFilter ? '/admin/notifications?unread_only=true' : '/admin/notifications';
+      const notifs = await adminFetch(url);
+      const list = document.getElementById('notifications-list');
+      document.getElementById('notifications-empty').style.display = notifs.length ? 'none' : 'block';
+      list.innerHTML = notifs.map(n => `
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; padding:12px 0; border-bottom:1px solid var(--border); ${n.is_read ? 'opacity:0.55;' : ''}">
+          <div>
+            <div style="font-weight:600; font-size:13.5px;">${PRIORITY_ICONS[n.priority] || ''} ${escapeHtml(n.title)}</div>
+            <div style="font-size:13px; margin-top:4px;">${escapeHtml(n.message)}</div>
+            <div style="font-size:11.5px; opacity:0.6; margin-top:4px;">${formatDate(n.created_at)}</div>
+          </div>
+          ${n.is_read ? '' : `<button class="btn small" data-id="${n.notification_id}">Mark read</button>`}
+        </div>
+      `).join('');
+      list.querySelectorAll('button[data-id]').forEach(btn => {
+        btn.addEventListener('click', () => markNotificationRead(btn.dataset.id));
+      });
+
+      // Badge: count of unread across ALL notifications, checked separately
+      // so the badge stays accurate even while viewing the "All" filter.
+      const unread = await adminFetch('/admin/notifications?unread_only=true');
+      const badge = document.getElementById('notif-badge');
+      if (unread.length > 0) {
+        badge.textContent = unread.length;
+        badge.style.display = 'inline-block';
+      } else {
+        badge.style.display = 'none';
+      }
+    } catch (e) { console.error(e); }
+  }
+
+  async function markNotificationRead(id) {
+    try {
+      await adminFetch('/admin/notifications/' + id + '/read', { method: 'PUT' });
+      loadNotifications();
+    } catch (e) { alert('Could not mark as read.'); }
+  }
+
+  document.getElementById('notif-filter').addEventListener('click', (e) => {
+    if (!e.target.classList.contains('filter-chip')) return;
+    document.querySelectorAll('#notif-filter .filter-chip').forEach(c => c.classList.remove('active'));
+    e.target.classList.add('active');
+    loadNotifications(e.target.dataset.unread === 'true');
+  });
+
   // --- Conversations ---
   async function loadConversations() {
     try {
@@ -477,16 +542,32 @@
       for (const c of convos) {
         const tr = document.createElement('tr');
         const label = c.customer_name || c.email || c.phone || c.user_id;
+        const mode = c.mode || 'ai';
         tr.innerHTML = `
           <td>${escapeHtml(label)}</td>
           <td>${formatDate(c.created_at)}</td>
           <td>${formatDate(c.updated_at)}</td>
-          <td><button class="btn small">View</button></td>
+          <td>${mode === 'human' ? '<span class="badge hot">Handled by you</span>' : '<span class="badge new">AI</span>'}</td>
+          <td>
+            <button class="btn small view-btn">View</button>
+            <button class="btn small ${mode === 'human' ? '' : 'danger'} handoff-btn">${mode === 'human' ? 'Return to AI' : 'Take Over'}</button>
+          </td>
         `;
-        tr.querySelector('button').addEventListener('click', () => viewMessages(c.conversation_id));
+        tr.querySelector('.view-btn').addEventListener('click', () => viewMessages(c.conversation_id));
+        tr.querySelector('.handoff-btn').addEventListener('click', () => toggleHandoff(c.conversation_id, mode));
         tbody.appendChild(tr);
       }
     } catch (e) { console.error(e); }
+  }
+
+  async function toggleHandoff(conversationId, currentMode) {
+    const newMode = currentMode === 'human' ? 'ai' : 'human';
+    try {
+      await adminFetch(`/admin/conversations/${conversationId}/mode`, {
+        method: 'PUT', body: JSON.stringify({ mode: newMode })
+      });
+      loadConversations();
+    } catch (e) { alert('Could not update conversation mode.'); }
   }
 
   async function viewMessages(conversationId) {

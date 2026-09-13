@@ -36,11 +36,6 @@ def _now() -> str:
 
 @contextmanager
 def get_conn():
-    """Yields a connection to the Turso database over HTTP. Raises a
-    clear error the caller can catch if the database is unavailable
-    (bad credentials, network issue) instead of crashing the whole app.
-    Rows returned by conn.execute(...).fetchone()/.fetchall() behave
-    like sqlite3.Row — support both row["col"] and dict(row)."""
     conn = None
     try:
         url = os.environ.get("TURSO_DATABASE_URL")
@@ -51,7 +46,7 @@ def get_conn():
                 "Add them to .env (local) or your host's environment variables (production)."
             )
         conn = turso_serverless.connect(url, auth_token=token)
-        conn.row_factory = turso_serverless.Row  # without this, rows come back as plain tuples
+        conn.row_factory = turso_serverless.Row
         yield conn
         conn.commit()
     except Exception as e:
@@ -71,8 +66,6 @@ def get_conn():
 
 
 def init_db():
-    """Creates all tables if they don't exist yet, and ensures the
-    default business row exists. Safe to call on every startup."""
     with get_conn() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS businesses (
@@ -105,18 +98,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS messages (
             message_id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-            sender TEXT NOT NULL,        -- 'user' or 'assistant'
+            sender TEXT NOT NULL,
             message TEXT NOT NULL,
-            message_type TEXT NOT NULL DEFAULT 'text',  -- 'text' | 'voice' | 'video'
+            message_type TEXT NOT NULL DEFAULT 'text',
             timestamp TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS customer_memory (
             user_id TEXT PRIMARY KEY REFERENCES customers(user_id),
             business_id TEXT NOT NULL REFERENCES businesses(business_id),
-            preferences TEXT,       -- free-text notes (e.g. "prefers black, budget-conscious")
-            important_info TEXT,    -- free-text notes (e.g. name, sizes, allergies)
-            summary TEXT,           -- rolling summary of older conversation content
+            preferences TEXT,
+            important_info TEXT,
+            summary TEXT,
             last_interaction TEXT
         );
 
@@ -133,7 +126,7 @@ def init_db():
             stock INTEGER DEFAULT 0,
             image_url TEXT,
             video_url TEXT,
-            keywords TEXT,          -- comma-separated, kept for simple matching
+            keywords TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -151,9 +144,6 @@ def init_db():
 
 
 def _add_column_if_missing(conn, table: str, column: str, definition: str):
-    """SQLite/libSQL doesn't support 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS',
-    so we just try the ALTER and swallow the error if the column already
-    exists. Makes migrations safe to run on every startup."""
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     except Exception as e:
@@ -162,19 +152,12 @@ def _add_column_if_missing(conn, table: str, column: str, definition: str):
 
 
 def migrate_v2_sales_agent():
-    """Adds everything needed for the AI Sales Agent upgrade: richer
-    product data, customer profiling (language/budget/lead scoring),
-    per-business customization (name/personality/instructions), orders,
-    and manager notifications. Purely additive — existing rows and
-    columns are untouched, so this is safe to run on every startup."""
     with get_conn() as conn:
-        # --- products: discount, multiple images/videos, brand ---
         _add_column_if_missing(conn, "products", "discount_price", "REAL")
-        _add_column_if_missing(conn, "products", "images", "TEXT")   # JSON array string
-        _add_column_if_missing(conn, "products", "videos", "TEXT")   # JSON array string
+        _add_column_if_missing(conn, "products", "images", "TEXT")
+        _add_column_if_missing(conn, "products", "videos", "TEXT")
         _add_column_if_missing(conn, "products", "brand", "TEXT")
 
-        # --- customers: profiling for sales intelligence ---
         _add_column_if_missing(conn, "customers", "language_preference", "TEXT")
         _add_column_if_missing(conn, "customers", "budget_min", "REAL")
         _add_column_if_missing(conn, "customers", "budget_max", "REAL")
@@ -182,11 +165,9 @@ def migrate_v2_sales_agent():
         _add_column_if_missing(conn, "customers", "lead_status", "TEXT DEFAULT 'new'")
         _add_column_if_missing(conn, "customers", "interests", "TEXT")
 
-        # --- conversations: human handoff support ---
         _add_column_if_missing(conn, "conversations", "mode", "TEXT DEFAULT 'ai'")
         _add_column_if_missing(conn, "conversations", "requires_human", "INTEGER DEFAULT 0")
 
-        # --- businesses: customizable identity + sales personality ---
         _add_column_if_missing(conn, "businesses", "ai_name", "TEXT")
         _add_column_if_missing(conn, "businesses", "logo_url", "TEXT")
         _add_column_if_missing(conn, "businesses", "personality", "TEXT DEFAULT 'friendly'")
@@ -221,7 +202,7 @@ def migrate_v2_sales_agent():
             business_id TEXT NOT NULL,
             user_id TEXT,
             conversation_id TEXT,
-            priority TEXT NOT NULL,   -- 'hot' | 'warm' | 'new' | 'human_help'
+            priority TEXT NOT NULL,
             title TEXT NOT NULL,
             message TEXT NOT NULL,
             product_id TEXT,
@@ -236,9 +217,6 @@ def migrate_v2_sales_agent():
 
 
 def migrate_products_from_json(json_path: str, business_id: str = DEFAULT_BUSINESS_ID):
-    """One-time migration: if the products table is empty, load
-    products.json into it so nothing is lost. Safe to call every
-    startup — it's a no-op once products exist in the DB."""
     with get_conn() as conn:
         count = conn.execute(
             "SELECT COUNT(*) AS c FROM products WHERE business_id = ?", (business_id,)
@@ -280,10 +258,6 @@ def migrate_products_from_json(json_path: str, business_id: str = DEFAULT_BUSINE
         logger.info(f"Migrated {len(legacy_products)} product(s) from {json_path}.")
 
 
-# ---------------------------------------------------------------------------
-# Customers
-# ---------------------------------------------------------------------------
-
 def get_or_create_customer(user_id: str, business_id: str = DEFAULT_BUSINESS_ID) -> dict:
     with get_conn() as conn:
         row = conn.execute(
@@ -298,10 +272,6 @@ def get_or_create_customer(user_id: str, business_id: str = DEFAULT_BUSINESS_ID)
         )
         return {"user_id": user_id, "business_id": business_id}
 
-
-# ---------------------------------------------------------------------------
-# Conversations
-# ---------------------------------------------------------------------------
 
 def create_conversation(user_id: str, business_id: str = DEFAULT_BUSINESS_ID, title: str = None) -> str:
     conversation_id = str(uuid.uuid4())
@@ -344,7 +314,6 @@ def touch_conversation(conversation_id: str):
 
 
 def delete_conversation(conversation_id: str, user_id: str) -> bool:
-    """Soft delete — only succeeds if the conversation belongs to user_id."""
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE conversations SET is_deleted = 1, updated_at = ? WHERE conversation_id = ? AND user_id = ?",
@@ -352,10 +321,6 @@ def delete_conversation(conversation_id: str, user_id: str) -> bool:
         )
         return cur.rowcount > 0
 
-
-# ---------------------------------------------------------------------------
-# Messages
-# ---------------------------------------------------------------------------
 
 def save_message(conversation_id: str, sender: str, message: str, message_type: str = "text"):
     with get_conn() as conn:
@@ -368,7 +333,6 @@ def save_message(conversation_id: str, sender: str, message: str, message_type: 
 
 
 def get_recent_messages(conversation_id: str, limit: int = 12) -> list[dict]:
-    """Most recent N messages, oldest-first (ready to feed to the model)."""
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM (
@@ -397,10 +361,6 @@ def count_messages(conversation_id: str) -> int:
             (conversation_id,)
         ).fetchone()["c"]
 
-
-# ---------------------------------------------------------------------------
-# Customer memory
-# ---------------------------------------------------------------------------
 
 def get_memory(user_id: str) -> dict | None:
     with get_conn() as conn:
@@ -434,10 +394,6 @@ def upsert_memory(user_id: str, business_id: str = DEFAULT_BUSINESS_ID,
                 (user_id, business_id, preferences, important_info, summary, _now())
             )
 
-
-# ---------------------------------------------------------------------------
-# Products
-# ---------------------------------------------------------------------------
 
 def list_products(business_id: str = DEFAULT_BUSINESS_ID) -> list[dict]:
     with get_conn() as conn:
@@ -546,10 +502,6 @@ def delete_product(product_id: str) -> bool:
         return cur.rowcount > 0
 
 
-# ---------------------------------------------------------------------------
-# Business settings (customizable AI name, personality, instructions, langs)
-# ---------------------------------------------------------------------------
-
 def get_business_settings(business_id: str = DEFAULT_BUSINESS_ID) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
@@ -574,13 +526,7 @@ def update_business_settings(business_id: str = DEFAULT_BUSINESS_ID, **fields) -
         return cur.rowcount > 0
 
 
-# ---------------------------------------------------------------------------
-# Customer profiling & lead scoring
-# ---------------------------------------------------------------------------
-
 def update_customer_profile(user_id: str, **fields) -> bool:
-    """Updates whichever profiling fields are provided — language, budget,
-    interests, name/email/phone. Only touches fields actually passed in."""
     allowed = {"name", "email", "phone", "language_preference",
                "budget_min", "budget_max", "interests"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
@@ -620,9 +566,6 @@ def _lead_status_for_score(score: int) -> str:
 
 
 def adjust_lead_score(user_id: str, delta: int, business_id: str = DEFAULT_BUSINESS_ID) -> int:
-    """Increases (or decreases) a customer's lead score by delta, clamped
-    to 0-100, and updates their lead_status to match. Returns the new score.
-    Safe to call even if the customer doesn't exist yet (creates them)."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT lead_score FROM customers WHERE user_id = ?", (user_id,)
@@ -645,8 +588,6 @@ def adjust_lead_score(user_id: str, delta: int, business_id: str = DEFAULT_BUSIN
 
 def list_leads(business_id: str = DEFAULT_BUSINESS_ID, status: str = None,
                 limit: int = 50, offset: int = 0) -> list[dict]:
-    """Customers ordered by lead score, optionally filtered by status
-    (new/interested/warm/hot), for the manager dashboard's Leads view."""
     query = "SELECT * FROM customers WHERE business_id = ?"
     params = [business_id]
     if status:
@@ -659,15 +600,19 @@ def list_leads(business_id: str = DEFAULT_BUSINESS_ID, status: str = None,
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Orders
-# ---------------------------------------------------------------------------
-
 ORDER_STATUSES = [
     "new_lead", "interested", "product_recommended", "added_to_cart",
     "order_pending", "order_confirmed", "manager_review_required",
     "processing", "shipped", "delivered", "cancelled",
 ]
+
+
+def get_order(order_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def create_order(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
@@ -720,10 +665,6 @@ def list_orders(business_id: str = DEFAULT_BUSINESS_ID, status: str = None,
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Manager notifications
-# ---------------------------------------------------------------------------
-
 def create_notification(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:
     notification_id = str(uuid.uuid4())
     with get_conn() as conn:
@@ -765,13 +706,7 @@ def mark_notification_read(notification_id: str) -> bool:
         return cur.rowcount > 0
 
 
-# ---------------------------------------------------------------------------
-# Human handoff
-# ---------------------------------------------------------------------------
-
 def set_conversation_mode(conversation_id: str, mode: str) -> bool:
-    """mode is 'ai' or 'human'. When 'human', the AI should stop
-    auto-replying until a manager sets it back to 'ai'."""
     if mode not in ("ai", "human"):
         return False
     with get_conn() as conn:

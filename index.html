@@ -56,7 +56,6 @@
     padding: 4px;
     flex-shrink: 0;
   }
-  
   .chat-header h1 {
     font-family: 'Poppins', sans-serif;
     font-size: 16px;
@@ -150,6 +149,29 @@
   .chat-input button:hover {
     background: var(--teal-dark);
   }
+  .demo-buttons {
+    display: flex;
+    gap: 6px;
+    padding: 0 14px 10px 14px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+  .demo-buttons::-webkit-scrollbar { height: 4px; }
+  .demo-chip {
+    flex-shrink: 0;
+    background: rgba(15, 61, 62, 0.08);
+    color: var(--teal);
+    border: none;
+    border-radius: 14px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-family: 'Inter', sans-serif;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .demo-chip:hover {
+    background: rgba(15, 61, 62, 0.16);
+  }
   #mic-btn {
     padding: 0 14px;
     background: var(--coral);
@@ -176,6 +198,15 @@
 
   <div class="chat-messages" id="chat-messages">
     <div class="bubble bot">Hey! I'm Jawad's assistant. What can I help with?</div>
+  </div>
+
+  <div class="demo-buttons" id="demo-buttons">
+    <button class="demo-chip" data-msg="Show me a black dress under 10,000 PKR">Black dress under 10,000 PKR</button>
+    <button class="demo-chip" data-msg="مجھے 8000 روپے کے اندر کوئی اچھا ڈریس چاہیے">اردو میں پوچھیں</button>
+    <button class="demo-chip" data-msg="زه یو ښه جامې غواړم د اسانتیا لپاره">پښتو کې پوښتنه</button>
+    <button class="demo-chip" data-msg="Can I see a video of this product?">See a product video</button>
+    <button class="demo-chip" data-msg="I want to order this">Place an order</button>
+    <button class="demo-chip" data-msg="Can someone call me about this?">Request a callback</button>
   </div>
 
   <div class="chat-input">

@@ -31,7 +31,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://virtual-assistant-pi-seven.vercel.app",
-        "http://localhost:8000",
+        "http://localhost:8000",  # for local testing
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,6 +48,7 @@ ASSISTANT_NAME = SETTINGS["assistant_name"]
 GREETING = SETTINGS["greeting"]
 FAQ = SETTINGS["faq"]
 
+# --- Database setup ---------------------------------------------------
 try:
     db.init_db()
     db.migrate_v2_sales_agent()
@@ -108,6 +109,13 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"actually came back from that tool. Never invent or guess product details. If the "
         f"customer asks about something not in the catalog or something you're not sure about, "
         f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
+
+        f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
+        f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
+        f"needs something genuinely outside what you can help with — call request_human_tool "
+        f"with a short reason, then tell them warmly that you're notifying the team and someone "
+        f"will help them soon. Never pretend to be human, and never keep pushing to solve it "
+        f"yourself once it's clear they need a person.\n\n"
 
         f"TAKING ORDERS: When a customer wants to buy something, collect the details step by "
         f"step in natural conversation — don't dump every question at once. You need: the "
@@ -445,7 +453,7 @@ LEAD_SIGNAL_POINTS = {
 }
 
 
-def make_lead_scoring_tool(user_id: str):
+def make_lead_scoring_tool(user_id: str, conversation_id: str = None):
     def log_customer_signal_tool(signal: str) -> str:
         """Call this once when the customer's message shows a genuine
         buying-interest signal — NOT for plain greetings or small talk.
@@ -458,13 +466,33 @@ def make_lead_scoring_tool(user_id: str):
         if not DB_AVAILABLE or signal not in LEAD_SIGNAL_POINTS:
             return json.dumps({"ok": False})
         try:
+            before = db.get_customer(user_id)
+            old_status = before.get("lead_status") if before else "new"
             new_score = db.adjust_lead_score(user_id, LEAD_SIGNAL_POINTS[signal])
+            _notify_if_became_hot(user_id, conversation_id, old_status, new_score)
             return json.dumps({"ok": True, "signal": signal, "new_score": new_score})
         except Exception as e:
             logger.error(f"Lead scoring failed: {e}")
             return json.dumps({"ok": False})
 
     return log_customer_signal_tool
+
+
+def _notify_if_became_hot(user_id: str, conversation_id: str, old_status: str, new_score: int):
+    """Fires a manager notification exactly once, at the moment a customer
+    crosses from below 'hot' into 'hot' — not on every subsequent message
+    once they're already hot, which would just spam the dashboard."""
+    new_status = db._lead_status_for_score(new_score)
+    if old_status != "hot" and new_status == "hot":
+        try:
+            customer = db.get_customer(user_id) or {}
+            db.create_notification(
+                user_id=user_id, conversation_id=conversation_id, priority="hot",
+                title="NEW HOT CUSTOMER LEAD 🔥",
+                message=f"{customer.get('name') or 'A customer'} (score: {new_score}) is showing strong buying signals. Recommended action: reach out or keep an eye on this conversation.",
+            )
+        except Exception as e:
+            logger.error(f"Could not create hot-lead notification: {e}")
 
 
 def make_order_tools(user_id: str, conversation_id: str):
@@ -504,7 +532,10 @@ def make_order_tools(user_id: str, conversation_id: str):
                 logger.error(f"Could not update customer profile during order: {e}")
 
         try:
-            db.adjust_lead_score(user_id, 20)
+            before = db.get_customer(user_id)
+            old_status = before.get("lead_status") if before else "new"
+            new_score = db.adjust_lead_score(user_id, 20)
+            _notify_if_became_hot(user_id, conversation_id, old_status, new_score)
         except Exception as e:
             logger.error(f"Lead scoring failed on order creation: {e}")
 
@@ -534,9 +565,27 @@ def make_order_tools(user_id: str, conversation_id: str):
             return json.dumps({"error": "Could not find that order."})
 
         try:
-            db.adjust_lead_score(user_id, 40)
+            before = db.get_customer(user_id)
+            old_status = before.get("lead_status") if before else "new"
+            new_score = db.adjust_lead_score(user_id, 40)
+            _notify_if_became_hot(user_id, conversation_id, old_status, new_score)
         except Exception as e:
             logger.error(f"Lead scoring failed on order confirmation: {e}")
+
+        try:
+            order = db.get_order(order_id) if hasattr(db, "get_order") else None
+            product_name = order.get("product_name") if order else "an item"
+            total = (order.get("price") or 0) * (order.get("quantity") or 1) if order else None
+            customer = db.get_customer(user_id) or {}
+            db.create_notification(
+                user_id=user_id, conversation_id=conversation_id, priority="hot",
+                title="ORDER CONFIRMED ✅",
+                message=f"{customer.get('name') or 'A customer'} confirmed an order for {product_name}"
+                        + (f" ({total} PKR)" if total else "") + f". Order ID: {order_id}",
+                product_id=order.get("product_id") if order else None,
+            )
+        except Exception as e:
+            logger.error(f"Could not create order-confirmed notification: {e}")
 
         return json.dumps({
             "order_id": order_id,
@@ -547,17 +596,52 @@ def make_order_tools(user_id: str, conversation_id: str):
     return create_order_tool, confirm_order_tool
 
 
+def make_human_handoff_tool(user_id: str, conversation_id: str):
+    def request_human_tool(reason: str) -> str:
+        """Call this when the customer explicitly asks to speak with a real
+        person, requests a phone call, has a complaint, asks for a discount
+        or exception you're not authorized to give, or needs something you
+        genuinely cannot help with. Do NOT pretend to be human or keep
+        trying to solve it yourself — flag it and let the team know. Give a
+        short one-sentence reason describing what the customer needs."""
+        if DB_AVAILABLE and conversation_id:
+            try:
+                db.flag_requires_human(conversation_id)
+                customer = db.get_customer(user_id) or {}
+                db.create_notification(
+                    user_id=user_id, conversation_id=conversation_id, priority="human_help",
+                    title="⚠️ HUMAN HELP REQUIRED",
+                    message=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}",
+                )
+            except Exception as e:
+                logger.error(f"Could not flag human handoff: {e}")
+        return json.dumps({
+            "ok": True,
+            "instruction": "Tell the customer, in their language, that you're notifying the team and someone will assist them shortly. Be warm and reassuring, not robotic."
+        })
+    return request_human_tool
+
+
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
+    # If a manager has taken this conversation over, the AI stays
+    # completely silent — no auto-replies until it's handed back.
+    if DB_AVAILABLE and conversation_id:
+        convo = db.get_conversation(conversation_id)
+        if convo and convo.get("mode") == "human":
+            return None
+
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
 
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
-    log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous")
+    log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous", conversation_id)
+    request_human_tool = make_human_handoff_tool(user_id or "anonymous", conversation_id)
     tool_functions = dict(TOOL_FUNCTIONS)
     tool_functions["create_order_tool"] = create_order_tool
     tool_functions["confirm_order_tool"] = confirm_order_tool
     tool_functions["log_customer_signal_tool"] = log_customer_signal_tool
+    tool_functions["request_human_tool"] = request_human_tool
 
     history = build_recent_history(conversation_id) if conversation_id else []
     contents = list(history) if history else [types.Content(role="user", parts=[types.Part(text=message)])]
@@ -565,7 +649,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     config = types.GenerateContentConfig(
         system_instruction=full_system_prompt,
         tools=[get_today_date, lookup_faq, get_weather, search_products_tool,
-               create_order_tool, confirm_order_tool, log_customer_signal_tool],
+               create_order_tool, confirm_order_tool, log_customer_signal_tool, request_human_tool],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
@@ -648,6 +732,10 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
+
+    if reply is None:
+        # A manager has taken this conversation over — the AI stays silent.
+        return {"reply": None, "conversation_id": conversation_id, "handed_off": True}
 
     if DB_AVAILABLE and conversation_id:
         try:
@@ -899,6 +987,45 @@ def admin_list_leads(x_api_key: str = Header(None), status: Optional[str] = None
     if not DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return db.list_leads(status=status, limit=limit)
+
+
+@app.get("/admin/notifications")
+def admin_list_notifications(x_api_key: str = Header(None), unread_only: bool = False,
+                              limit: int = Query(50, le=200)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return db.list_notifications(unread_only=unread_only, limit=limit)
+
+
+@app.put("/admin/notifications/{notification_id}/read")
+def admin_mark_notification_read(notification_id: str, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = db.mark_notification_read(notification_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"updated": True}
+
+
+class ConversationModeUpdate(BaseModel):
+    mode: str  # "ai" or "human"
+
+
+@app.put("/admin/conversations/{conversation_id}/mode")
+def admin_set_conversation_mode(conversation_id: str, update: ConversationModeUpdate,
+                                 x_api_key: str = Header(None)):
+    """Lets a manager take a conversation over from the AI ('human') or
+    hand it back ('ai'). While in 'human' mode, /chat stays silent for
+    this conversation."""
+    check_api_key(x_api_key)
+    if not DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = db.set_conversation_mode(conversation_id, update.mode)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid conversation_id or mode (must be 'ai' or 'human')")
+    return {"updated": True, "mode": update.mode}
 
 
 @app.get("/index.html")
