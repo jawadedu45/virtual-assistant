@@ -165,13 +165,14 @@
       <input id="p-video" placeholder="Video filename (in /videos)">
       <input id="p-discount" placeholder="Discount price (optional)" type="number">
       <input id="p-brand" placeholder="Brand (optional)">
+      <input id="p-image" placeholder="Image URL (link, optional)" style="grid-column: span 2;">
     </div>
     <button class="btn" onclick="addProduct()">Add Product</button>
     <div id="error-msg-products" style="color:#c0392b; font-size:13px; margin-top:8px;"></div>
 
     <h3 class="section-title" style="margin-top:26px;">Catalog</h3>
     <table id="products-table">
-      <thead><tr><th>Name</th><th>Category</th><th>Price</th><th>Discount</th><th>Color</th><th>Stock</th><th>Keywords</th><th></th></tr></thead>
+      <thead><tr><th>Image</th><th>Name</th><th>Category</th><th>Price</th><th>Discount</th><th>Color</th><th>Stock</th><th>Keywords</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <div class="empty-note" id="products-empty" style="display:none;">No products yet — add one above.</div>
@@ -232,7 +233,6 @@
       <div id="messages-list"></div>
     </div>
   </div>
-
 
   <div class="panel" id="panel-customers">
     <h3 class="section-title">Customers</h3>
@@ -350,7 +350,11 @@
         const priceCell = p.discount_price
           ? `<s style="opacity:0.5;">${p.price}</s> ${p.discount_price} ${p.currency}`
           : `${p.price != null ? p.price + ' ' + p.currency : '—'}`;
+        const thumbCell = p.image_url
+          ? `<img src="${escapeHtml(p.image_url)}" style="width:36px; height:36px; object-fit:cover; border-radius:6px;" onerror="this.style.display='none'">`
+          : `<button class="btn small" data-imgid="${p.product_id}" style="font-size:11px; padding:4px 8px;">Set Image</button>`;
         tr.innerHTML = `
+          <td>${thumbCell}</td>
           <td>${escapeHtml(p.product_name)}</td>
           <td>${escapeHtml(p.category || '—')}</td>
           <td>${priceCell}</td>
@@ -360,10 +364,21 @@
           <td>${escapeHtml(p.keywords || '—')}</td>
           <td><button class="btn small danger" data-id="${p.product_id}">Delete</button></td>
         `;
-        tr.querySelector('button').addEventListener('click', () => deleteProduct(p.product_id));
+        tr.querySelector('button[data-id]').addEventListener('click', () => deleteProduct(p.product_id));
+        const imgBtn = tr.querySelector('button[data-imgid]');
+        if (imgBtn) imgBtn.addEventListener('click', () => setProductImage(p.product_id));
         tbody.appendChild(tr);
       }
     } catch (e) { console.error(e); }
+  }
+
+  async function setProductImage(productId) {
+    const url = prompt('Paste the image URL for this product:');
+    if (!url || !url.trim()) return;
+    try {
+      await adminFetch('/admin/products/' + productId, { method: 'PUT', body: JSON.stringify({ image_url: url.trim() }) });
+      loadProducts();
+    } catch (e) { alert('Could not set image.'); }
   }
 
   async function addProduct() {
@@ -384,11 +399,12 @@
       video_url: document.getElementById('p-video').value.trim() || null,
       discount_price: parseFloat(document.getElementById('p-discount').value) || null,
       brand: document.getElementById('p-brand').value.trim() || null,
+      image_url: document.getElementById('p-image').value.trim() || null,
     };
 
     try {
       await adminFetch('/admin/products', { method: 'POST', body: JSON.stringify(payload) });
-      ['p-name','p-category','p-price','p-color','p-size','p-keywords','p-video','p-discount','p-brand'].forEach(id => document.getElementById(id).value = '');
+      ['p-name','p-category','p-price','p-color','p-size','p-keywords','p-video','p-discount','p-brand','p-image'].forEach(id => document.getElementById(id).value = '');
       document.getElementById('p-stock').value = '0';
       document.getElementById('p-currency').value = 'PKR';
       loadProducts();
@@ -505,8 +521,6 @@
         btn.addEventListener('click', () => markNotificationRead(btn.dataset.id));
       });
 
-      // Badge: count of unread across ALL notifications, checked separately
-      // so the badge stays accurate even while viewing the "All" filter.
       const unread = await adminFetch('/admin/notifications?unread_only=true');
       const badge = document.getElementById('notif-badge');
       if (unread.length > 0) {
