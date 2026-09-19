@@ -654,6 +654,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     )
 
     response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+    logger.info(f"DIAGNOSTIC: initial response has {len(response.function_calls or [])} tool call(s)")
 
     max_turns = 5
     turns = 0
@@ -663,10 +664,12 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
         function_response_parts = []
         for fc in response.function_calls:
+            logger.info(f"DIAGNOSTIC: model called tool '{fc.name}' with args {fc.args}")
             func = tool_functions.get(fc.name)
             if func:
                 try:
                     result = func(**(fc.args or {}))
+                    logger.info(f"DIAGNOSTIC: tool '{fc.name}' returned: {result[:500]}")
                 except Exception as e:
                     logger.error(f"Tool '{fc.name}' failed: {e}")
                     result = f"Error running {fc.name}: {e}"
@@ -678,6 +681,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         contents.append(types.Content(role="user", parts=function_response_parts))
 
         response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+        logger.info(f"DIAGNOSTIC: follow-up response has {len(response.function_calls or [])} more tool call(s)")
 
     return response.text
 
