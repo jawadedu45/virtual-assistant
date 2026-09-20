@@ -171,6 +171,15 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
         f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
 
+        f"MEDIA — CRITICAL: search_products_tool results include has_image and has_video flags. "
+        f"When a product you're discussing has has_image or has_video set to true, its actual "
+        f"photo or video is shown to the customer automatically, right in this chat, immediately "
+        f"after your reply — you do NOT send it and must NEVER claim you can't display pictures "
+        f"or offer to send it another way (WhatsApp, email, etc.) instead. Just say something "
+        f"natural like 'Here's a look at it 👇' or 'Take a look below' and it will appear on its "
+        f"own. Only offer an alternative like WhatsApp if has_image and has_video are BOTH false "
+        f"for that product — meaning no photo or video exists for it yet.\n\n"
+
         f"TRACKING INTEREST: Silently call log_customer_signal_tool whenever the customer's "
         f"message shows real buying interest — asking the price, asking if something's in "
         f"stock, asking about delivery, asking about payment methods, or sharing contact info "
@@ -218,46 +227,62 @@ def get_weather(city: str) -> str:
         return "Sorry, I couldn't fetch the weather right now."
 
 
-def search_products_tool(keyword: str = None, category: str = None,
-                          max_price: float = None, min_price: float = None,
-                          color: str = None) -> str:
-    """Searches the store's product catalog. Use this whenever a customer
-    asks about items, prices, colors, categories, availability, discounts,
-    or wants to see product images/videos. Returns a JSON list of matching
-    products (name, price, discount_price if any, currency, color, size,
-    stock, brand, description, whether images/video are available) —
-    at most 5 results."""
-    if not DB_AVAILABLE:
-        return json.dumps([])
-    try:
-        results = db.search_products(
-            keyword=keyword, category=category,
-            max_price=max_price, min_price=min_price, color=color
-        )
-        print("TOOL ARGS:", keyword, category, max_price, min_price, color)
-        print("TOOL RESULT:", [r["product_name"] for r in results])
-        trimmed = [
-            {
-                "product_id": r["product_id"],
-                "name": r["product_name"],
-                "category": r["category"],
-                "price": r["price"],
-                "discount_price": r.get("discount_price"),
-                "currency": r["currency"],
-                "color": r["color"],
-                "size": r["size"],
-                "stock": r["stock"],
-                "brand": r.get("brand"),
-                "description": r["description"],
-                "has_image": bool(r.get("image_url") or r.get("images")),
-                "has_video": bool(r.get("video_url") or r.get("videos")),
-            }
-            for r in results
-        ]
-        return json.dumps(trimmed)
-    except Exception as e:
-        logger.error(f"Product search failed: {e}")
-        return json.dumps([])
+def make_search_tool():
+    """Creates a per-request search_products_tool AND a list that gets
+    filled with the FULL raw product dict(s) (including image_url/videos,
+    which are deliberately kept OUT of what's returned to the model) from
+    the most recent search call this turn. generate_reply() uses that list
+    afterwards to attach the right picture/video to the reply — this is
+    tied to the actual product the AI just looked up and is discussing,
+    not a guess based on scanning the customer's raw message text."""
+    last_search_results = []
+
+    def search_products_tool(keyword: str = None, category: str = None,
+                              max_price: float = None, min_price: float = None,
+                              color: str = None) -> str:
+        """Searches the store's product catalog. Use this whenever a customer
+        asks about items, prices, colors, categories, availability, discounts,
+        or wants to see product images/videos. Returns a JSON list of matching
+        products (name, price, discount_price if any, currency, color, size,
+        stock, brand, description, whether images/video are available) —
+        at most 5 results."""
+        if not DB_AVAILABLE:
+            return json.dumps([])
+        try:
+            results = db.search_products(
+                keyword=keyword, category=category,
+                max_price=max_price, min_price=min_price, color=color
+            )
+            print("TOOL ARGS:", keyword, category, max_price, min_price, color)
+            print("TOOL RESULT:", [r["product_name"] for r in results])
+
+            last_search_results.clear()
+            last_search_results.extend(results)
+
+            trimmed = [
+                {
+                    "product_id": r["product_id"],
+                    "name": r["product_name"],
+                    "category": r["category"],
+                    "price": r["price"],
+                    "discount_price": r.get("discount_price"),
+                    "currency": r["currency"],
+                    "color": r["color"],
+                    "size": r["size"],
+                    "stock": r["stock"],
+                    "brand": r.get("brand"),
+                    "description": r["description"],
+                    "has_image": bool(r.get("image_url") or r.get("images")),
+                    "has_video": bool(r.get("video_url") or r.get("videos")),
+                }
+                for r in results
+            ]
+            return json.dumps(trimmed)
+        except Exception as e:
+            logger.error(f"Product search failed: {e}")
+            return json.dumps([])
+
+    return search_products_tool, last_search_results
 
 
 def _first_image_url(product: dict):
@@ -282,26 +307,6 @@ def _first_image_url(product: dict):
         first = images.split(",")[0].strip()
         return first or None
     return None
-
-
-def find_product_media(message: str):
-    """Checks a message for product keywords and returns a
-    (image_url, video_url) tuple for the first matching product — either
-    can be None. This is what actually sends pictures/video back to the
-    customer in the chat, separate from what the AI mentions in text."""
-    message = message.lower().strip()
-    if not DB_AVAILABLE:
-        return None, None
-    try:
-        for product in db.list_products():
-            keywords = (product.get("keywords") or "").split(",")
-            for keyword in keywords:
-                keyword = keyword.strip().lower()
-                if keyword and keyword in message:
-                    return _first_image_url(product), product.get("video_url")
-    except Exception as e:
-        logger.error(f"Product media lookup failed: {e}")
-    return None, None
 
 
 DOCUMENT_CHUNKS = [
@@ -514,7 +519,6 @@ TOOL_FUNCTIONS = {
     "get_today_date": get_today_date,
     "lookup_faq": lookup_faq,
     "get_weather": get_weather,
-    "search_products_tool": search_products_tool,
 }
 
 
@@ -721,22 +725,28 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
     return request_human_tool
 
 
-def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
+def generate_reply(message: str, user_id: str = None, conversation_id: str = None):
+    """Returns (reply_text, image_url, video_filename). reply_text is None
+    if a manager has taken the conversation over (AI stays silent); the
+    media fields are None whenever no product was searched this turn, or
+    the searched product has no image/video."""
     # If a manager has taken this conversation over, the AI stays
     # completely silent — no auto-replies until it's handed back.
     if DB_AVAILABLE and conversation_id:
         convo = db.get_conversation(conversation_id)
         if convo and convo.get("mode") == "human":
-            return None
+            return None, None, None
 
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
 
+    search_products_tool, last_search_results = make_search_tool()
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
     log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous", conversation_id)
     request_human_tool = make_human_handoff_tool(user_id or "anonymous", conversation_id)
     tool_functions = dict(TOOL_FUNCTIONS)
+    tool_functions["search_products_tool"] = search_products_tool
     tool_functions["create_order_tool"] = create_order_tool
     tool_functions["confirm_order_tool"] = confirm_order_tool
     tool_functions["log_customer_signal_tool"] = log_customer_signal_tool
@@ -782,7 +792,16 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
         logger.info(f"DIAGNOSTIC: follow-up response has {len(response.function_calls or [])} more tool call(s)")
 
-    return response.text
+    image_url = None
+    video_file = None
+    if last_search_results:
+        # The top result of the most recent search this turn — the product
+        # the AI is actually discussing right now.
+        top_product = last_search_results[0]
+        image_url = _first_image_url(top_product)
+        video_file = top_product.get("video_url")
+
+    return response.text, image_url, video_file
 
 
 def text_to_speech(text: str) -> str:
@@ -831,7 +850,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
             conversation_id = None
 
     try:
-        reply = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
+        reply, image_url, video_file = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
@@ -847,8 +866,6 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist reply: {e}")
 
-    # --- NEW: image support alongside the existing video support ---
-    image_url, video_file = find_product_media(request.message)
     result = {"reply": reply, "conversation_id": conversation_id}
 
     if image_url:
@@ -907,7 +924,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
             conversation_id = None
 
     try:
-        reply = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
+        reply, image_url, video_file = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
         reply_audio = text_to_speech(reply)
     except Exception as e:
         logger.error(f"Error generating voice reply: {e}")
@@ -920,8 +937,6 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist voice reply: {e}")
 
-    # --- NEW: image/video support on voice replies too ---
-    image_url, video_file = find_product_media(transcript)
     result = {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
     if image_url:
         result["image_url"] = image_url
