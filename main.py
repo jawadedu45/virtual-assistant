@@ -153,7 +153,12 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"Only ever mention products, prices, colors, sizes, discounts, or stock levels that "
         f"actually came back from that tool. Never invent or guess product details. If the "
         f"customer asks about something not in the catalog or something you're not sure about, "
-        f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
+        f"say so honestly and offer to have the team follow up — don't make something up. "
+        f"IMPORTANT: call search_products_tool again for a product any time you're actively "
+        f"discussing it with the customer — checking stock, confirming price, or mentioning a "
+        f"photo/video — even if you already searched for it earlier in this same conversation. "
+        f"Do not rely on what you remember from earlier messages for these details; only a fresh "
+        f"tool call tells you whether a photo or video is currently available to show.\n\n"
 
         f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
         f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
