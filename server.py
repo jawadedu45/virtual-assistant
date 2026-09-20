@@ -189,6 +189,8 @@ def search_products_tool(keyword: str = None, category: str = None,
             keyword=keyword, category=category,
             max_price=max_price, min_price=min_price, color=color
         )
+        print("TOOL ARGS:", keyword, category, max_price, min_price, color)
+        print("TOOL RESULT:", [r["product_name"] for r in results])
         trimmed = [
             {
                 "product_id": r["product_id"],
