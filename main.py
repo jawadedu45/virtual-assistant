@@ -176,14 +176,18 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
         f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
 
-        f"MEDIA — CRITICAL: search_products_tool results include has_image and has_video flags. "
-        f"When a product you're discussing has has_image or has_video set to true, its actual "
-        f"photo or video is shown to the customer automatically, right in this chat, immediately "
-        f"after your reply — you do NOT send it and must NEVER claim you can't display pictures "
-        f"or offer to send it another way (WhatsApp, email, etc.) instead. Just say something "
-        f"natural like 'Here's a look at it 👇' or 'Take a look below' and it will appear on its "
-        f"own. Only offer an alternative like WhatsApp if has_image and has_video are BOTH false "
-        f"for that product — meaning no photo or video exists for it yet.\n\n"
+        f"MEDIA — HIGHEST PRIORITY RULE: This chat interface CAN and DOES show real photos and "
+        f"videos directly to the customer — you are NOT a text-only assistant here. Whenever "
+        f"search_products_tool returns has_image: true or has_video: true for a product you are "
+        f"discussing, the actual photo or video is displayed automatically, right in this chat, "
+        f"immediately below your reply. You are FORBIDDEN from saying any of the following when "
+        f"has_image or has_video is true for that product: 'I cannot show images', 'I'm a text "
+        f"assistant', 'I can't display pictures here', 'I'll have the team send it', 'I can send "
+        f"it to your WhatsApp', or anything with a similar meaning. Instead, simply say something "
+        f"short like 'Here's a look at it 👇' or 'Take a look below 👇' and STOP — do not mention "
+        f"WhatsApp, email, or any other delivery method at all. The only time you may offer an "
+        f"alternative like having the team follow up is when has_image AND has_video are BOTH "
+        f"false for that specific product — meaning no photo or video exists for it yet.\n\n"
 
         f"TRACKING INTEREST: Silently call log_customer_signal_tool whenever the customer's "
         f"message shows real buying interest — asking the price, asking if something's in "
@@ -192,7 +196,11 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"the customer, never let it change your tone, just call it quietly alongside your "
         f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
 
-        f"Keep replies natural and conversational — not overly long, not robotic."
+        f"Keep replies natural and conversational — not overly long, not robotic.\n\n"
+
+        f"One last reminder: if the product you're discussing has has_image or has_video true, "
+        f"never mention WhatsApp, email, or 'the team will send it' — the picture just appears "
+        f"below your message automatically."
     )
 
     if custom_instructions:
