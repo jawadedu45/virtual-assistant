@@ -808,11 +808,24 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     image_url = None
     video_file = None
     if last_search_results:
-        # The top result of the most recent search this turn — the product
-        # the AI is actually discussing right now.
-        top_product = last_search_results[0]
-        image_url = _first_image_url(top_product)
-        video_file = top_product.get("video_url")
+        # Match the picture to whichever product the AI actually wrote about
+        # in its reply — NOT just the first search result, since one search
+        # can return several similar products (e.g. multiple waistcoats) and
+        # the first one back isn't necessarily the one being discussed.
+        reply_lower = (response.text or "").lower()
+        matched_product = None
+        for product in last_search_results:
+            name = (product.get("product_name") or "").lower()
+            if name and name in reply_lower:
+                matched_product = product
+                break
+        if matched_product is None:
+            # Fallback: no exact name match found in the text (e.g. the AI
+            # paraphrased the name) — use the top search result as before.
+            matched_product = last_search_results[0]
+
+        image_url = _first_image_url(matched_product)
+        video_file = matched_product.get("video_url")
 
     return response.text, image_url, video_file
 
