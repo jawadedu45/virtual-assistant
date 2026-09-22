@@ -110,6 +110,14 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"customer asks about something not in the catalog or something you're not sure about, "
         f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
 
+        f"IMAGES: You cannot send pictures via WhatsApp, email, SMS, or any channel outside "
+        f"this chat — you have no such capability, so never offer to, never claim you will, "
+        f"and never ask for or reference a phone number for that purpose. If a product's search "
+        f"result shows has_image as true, just say the picture will appear right here in the "
+        f"chat (it's shown automatically below your message) — don't describe sending it "
+        f"anywhere. If has_image is false, say honestly that no photo is available for that "
+        f"item.\n\n"
+
         f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
         f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
         f"needs something genuinely outside what you can help with — call request_human_tool "
@@ -229,6 +237,23 @@ def find_product_video(message: str):
                     return product.get("video_url")
     except Exception as e:
         logger.error(f"Video lookup failed: {e}")
+    return None
+
+
+def find_product_image(message: str):
+    """Checks a message for product keywords and returns the matching image URL, if any."""
+    message = message.lower().strip()
+    if not DB_AVAILABLE:
+        return None
+    try:
+        for product in db.list_products():
+            keywords = (product.get("keywords") or "").split(",")
+            for keyword in keywords:
+                keyword = keyword.strip().lower()
+                if keyword and keyword in message:
+                    return product.get("image_url")
+    except Exception as e:
+        logger.error(f"Image lookup failed: {e}")
     return None
 
 
@@ -750,8 +775,18 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist reply: {e}")
 
-    video_file = find_product_video(request.message)
     result = {"reply": reply, "conversation_id": conversation_id}
+
+    image_url = find_product_image(request.message)
+    if image_url:
+        result["image_url"] = image_url
+        if DB_AVAILABLE and conversation_id:
+            try:
+                db.save_message(conversation_id, "assistant", image_url, "image")
+            except Exception as e:
+                logger.error(f"Could not persist image message: {e}")
+
+    video_file = find_product_video(request.message)
     if video_file:
         video_url = f"/videos/{video_file}"
         result["video_url"] = video_url
@@ -760,6 +795,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
                 db.save_message(conversation_id, "assistant", video_url, "video")
             except Exception as e:
                 logger.error(f"Could not persist video message: {e}")
+
     return result
 
 
@@ -812,7 +848,28 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist voice reply: {e}")
 
-    return {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
+    result = {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
+
+    image_url = find_product_image(transcript)
+    if image_url:
+        result["image_url"] = image_url
+        if DB_AVAILABLE and conversation_id:
+            try:
+                db.save_message(conversation_id, "assistant", image_url, "image")
+            except Exception as e:
+                logger.error(f"Could not persist image message: {e}")
+
+    video_file = find_product_video(transcript)
+    if video_file:
+        video_url = f"/videos/{video_file}"
+        result["video_url"] = video_url
+        if DB_AVAILABLE and conversation_id:
+            try:
+                db.save_message(conversation_id, "assistant", video_url, "video")
+            except Exception as e:
+                logger.error(f"Could not persist video message: {e}")
+
+    return result
 
 
 @app.get("/conversations")
