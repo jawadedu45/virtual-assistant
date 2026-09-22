@@ -30,3 +30,11 @@ If you use Gmail: you can't use your normal password — you need a 16-character
 
 ## To deploy
 Replace your existing `main.py` (or whatever your entry file is actually named — confirm it matches what your `Procfile`/start command points to), `app.js`, and `admin.html` with these three files, add the SMTP env vars, and redeploy.
+
+## 4. Fix: the AI was offering WhatsApp instead of showing the picture
+Root cause was two separate bugs, both now fixed in `main.py`:
+
+1. **The AI didn't know pictures auto-attach.** The system prompt never told it that a product's photo/video is delivered automatically alongside its reply — so it defaulted to its trained instinct of "I'm just text, I can't show images" and improvised a WhatsApp workaround. Added a new MEDIA section to the system prompt that tells it explicitly: if a product it's discussing has an image or video, just say something like "Here's a look at it 👇" — never claim it can't show pictures or offer an alternative channel unless the product genuinely has no photo/video at all.
+2. **Picture-matching was disconnected from what the AI actually found.** The old code re-scanned the raw customer message for keyword matches against every product in the catalog — independent of what the AI had actually searched for. Replaced with `make_search_tool()`, which captures the real product(s) returned by the AI's own `search_products_tool` call that turn, so the photo sent is always the one for the product actually being discussed.
+
+`generate_reply()` now returns `(reply_text, image_url, video_filename)` instead of just text — `/chat` and `/voice-chat` were updated to match.
