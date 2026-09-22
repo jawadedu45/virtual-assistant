@@ -807,23 +807,37 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
     image_url = None
     video_file = None
-    if last_search_results:
-        # Match the picture to whichever product the AI actually wrote about
-        # in its reply — NOT just the first search result, since one search
-        # can return several similar products (e.g. multiple waistcoats) and
-        # the first one back isn't necessarily the one being discussed.
-        reply_lower = (response.text or "").lower()
-        matched_product = None
-        for product in last_search_results:
-            name = (product.get("product_name") or "").lower()
-            if name and name in reply_lower:
-                matched_product = product
-                break
-        if matched_product is None:
-            # Fallback: no exact name match found in the text (e.g. the AI
-            # paraphrased the name) — use the top search result as before.
-            matched_product = last_search_results[0]
+    matched_product = None
+    reply_lower = (response.text or "").lower()
 
+    # 1) Prefer a product actually returned by a search call THIS turn —
+    # most reliable, since we know it's current (fresh price/stock/media).
+    for product in last_search_results:
+        name = (product.get("product_name") or "").lower()
+        if name and name in reply_lower:
+            matched_product = product
+            break
+
+    # 2) Fallback: the AI didn't search this turn (e.g. it's answering from
+    # earlier conversation memory) but is still naming a specific product in
+    # its reply — scan the full catalog so the picture still attaches
+    # instead of depending on the AI remembering to search again.
+    if matched_product is None and DB_AVAILABLE:
+        try:
+            for product in db.list_products():
+                name = (product.get("product_name") or "").lower()
+                if name and name in reply_lower:
+                    matched_product = product
+                    break
+        except Exception as e:
+            logger.error(f"Catalog media fallback failed: {e}")
+
+    # 3) Last resort: no name match at all, but a search did happen this
+    # turn — use its top result rather than showing nothing.
+    if matched_product is None and last_search_results:
+        matched_product = last_search_results[0]
+
+    if matched_product:
         image_url = _first_image_url(matched_product)
         video_file = matched_product.get("video_url")
 
