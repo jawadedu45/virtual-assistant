@@ -17,11 +17,36 @@ import logging
 import base64
 import wave
 import io
+import time
+import random
 
 import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def generate_content_with_retry(model: str, contents, config=None, max_retries: int = 3):
+    """Wraps client.models.generate_content with retry + backoff for
+    transient errors (503 UNAVAILABLE, 429 rate limit, etc). Gemini's
+    -flash models occasionally return these under load; retrying after
+    a short wait usually succeeds within a couple of tries."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if config is not None:
+                return client.models.generate_content(model=model, contents=contents, config=config)
+            return client.models.generate_content(model=model, contents=contents)
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            if not is_transient or attempt == max_retries - 1:
+                raise
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Transient error on attempt {attempt + 1}/{max_retries}, retrying in {wait_time:.1f}s: {e}")
+            time.sleep(wait_time)
+    raise last_error
 
 load_dotenv()
 
@@ -337,7 +362,7 @@ def maybe_update_memory(user_id: str, conversation_id: str):
             f"Recent conversation:\n{transcript}"
         )
 
-        response = client.models.generate_content(model="gemini-3.5-flash", contents=prompt)
+        response = generate_content_with_retry(model="gemini-3.5-flash", contents=prompt)
         raw = response.text.strip().strip("`").lstrip("json").strip()
         parsed = json.loads(raw)
 
@@ -680,7 +705,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
-    response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+    response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
     logger.info(f"DIAGNOSTIC: initial response has {len(response.function_calls or [])} tool call(s)")
 
     max_turns = 5
@@ -707,14 +732,14 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
             )
         contents.append(types.Content(role="user", parts=function_response_parts))
 
-        response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+        response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
         logger.info(f"DIAGNOSTIC: follow-up response has {len(response.function_calls or [])} more tool call(s)")
 
     return response.text
 
 
 def text_to_speech(text: str) -> str:
-    response = client.models.generate_content(
+    response = generate_content_with_retry(
         model="gemini-3.1-flash-tts-preview",
         contents=text,
         config=types.GenerateContentConfig(
@@ -813,7 +838,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         raise HTTPException(status_code=400, detail="Invalid audio data")
 
     try:
-        transcription_response = client.models.generate_content(
+        transcription_response = generate_content_with_retry(
             model="gemini-3.5-flash",
             contents=[
                 types.Part.from_bytes(data=audio_bytes, mime_type=request.mime_type),
