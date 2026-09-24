@@ -17,13 +17,36 @@ import logging
 import base64
 import wave
 import io
-import smtplib
-from email.mime.text import MIMEText
+import time
+import random
 
 import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def generate_content_with_retry(model: str, contents, config=None, max_retries: int = 3):
+    """Wraps client.models.generate_content with retry + backoff for
+    transient errors (503 UNAVAILABLE, 429 rate limit, etc). Gemini's
+    -flash models occasionally return these under load; retrying after
+    a short wait usually succeeds within a couple of tries."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if config is not None:
+                return client.models.generate_content(model=model, contents=contents, config=config)
+            return client.models.generate_content(model=model, contents=contents)
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            if not is_transient or attempt == max_retries - 1:
+                raise
+            wait_time = (2 ** attempt) + random.uniform(0, 1)
+            logger.warning(f"Transient error on attempt {attempt + 1}/{max_retries}, retrying in {wait_time:.1f}s: {e}")
+            time.sleep(wait_time)
+    raise last_error
 
 load_dotenv()
 
@@ -70,49 +93,6 @@ PERSONALITY_STYLES = {
 }
 
 
-# =======================================================================
-# MANAGER NOTIFICATIONS (NEW)
-# =======================================================================
-# Sends a real email to the manager, in addition to the in-app notification
-# row that db.create_notification() already writes. Controlled by the
-# business settings "notifications_enabled" flag (default: on) and by the
-# SMTP_* / MANAGER_EMAIL environment variables below. If those env vars
-# aren't set, this silently no-ops (logs a warning) instead of crashing —
-# so the bot keeps working even before you've configured email.
-def send_manager_email(subject: str, body: str):
-    try:
-        biz = db.get_business_settings() if DB_AVAILABLE else None
-        # Only skip if the owner has explicitly turned notifications off.
-        if biz is not None and biz.get("notifications_enabled") == 0:
-            return
-
-        manager_email = os.getenv("MANAGER_EMAIL")
-        smtp_host = os.getenv("SMTP_HOST")
-        smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        smtp_user = os.getenv("SMTP_USER")
-        smtp_pass = os.getenv("SMTP_PASS")
-
-        if not all([manager_email, smtp_host, smtp_user, smtp_pass]):
-            logger.warning(
-                "Manager email not sent — set MANAGER_EMAIL, SMTP_HOST, "
-                "SMTP_USER, SMTP_PASS in your .env to enable real email alerts."
-            )
-            return
-
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = smtp_user
-        msg["To"] = manager_email
-
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [manager_email], msg.as_string())
-        logger.info(f"Manager email sent: {subject}")
-    except Exception as e:
-        logger.error(f"Manager email failed: {e}")
-
-
 def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
     biz = db.get_business_settings() if DB_AVAILABLE else None
 
@@ -153,12 +133,15 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"Only ever mention products, prices, colors, sizes, discounts, or stock levels that "
         f"actually came back from that tool. Never invent or guess product details. If the "
         f"customer asks about something not in the catalog or something you're not sure about, "
-        f"say so honestly and offer to have the team follow up — don't make something up. "
-        f"IMPORTANT: call search_products_tool again for a product any time you're actively "
-        f"discussing it with the customer — checking stock, confirming price, or mentioning a "
-        f"photo/video — even if you already searched for it earlier in this same conversation. "
-        f"Do not rely on what you remember from earlier messages for these details; only a fresh "
-        f"tool call tells you whether a photo or video is currently available to show.\n\n"
+        f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
+
+        f"IMAGES: You cannot send pictures via WhatsApp, email, SMS, or any channel outside "
+        f"this chat — you have no such capability, so never offer to, never claim you will, "
+        f"and never ask for or reference a phone number for that purpose. If a product's search "
+        f"result shows has_image as true, just say the picture will appear right here in the "
+        f"chat (it's shown automatically below your message) — don't describe sending it "
+        f"anywhere. If has_image is false, say honestly that no photo is available for that "
+        f"item.\n\n"
 
         f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
         f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
@@ -176,19 +159,6 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
         f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
 
-        f"MEDIA — HIGHEST PRIORITY RULE: This chat interface CAN and DOES show real photos and "
-        f"videos directly to the customer — you are NOT a text-only assistant here. Whenever "
-        f"search_products_tool returns has_image: true or has_video: true for a product you are "
-        f"discussing, the actual photo or video is displayed automatically, right in this chat, "
-        f"immediately below your reply. You are FORBIDDEN from saying any of the following when "
-        f"has_image or has_video is true for that product: 'I cannot show images', 'I'm a text "
-        f"assistant', 'I can't display pictures here', 'I'll have the team send it', 'I can send "
-        f"it to your WhatsApp', or anything with a similar meaning. Instead, simply say something "
-        f"short like 'Here's a look at it 👇' or 'Take a look below 👇' and STOP — do not mention "
-        f"WhatsApp, email, or any other delivery method at all. The only time you may offer an "
-        f"alternative like having the team follow up is when has_image AND has_video are BOTH "
-        f"false for that specific product — meaning no photo or video exists for it yet.\n\n"
-
         f"TRACKING INTEREST: Silently call log_customer_signal_tool whenever the customer's "
         f"message shows real buying interest — asking the price, asking if something's in "
         f"stock, asking about delivery, asking about payment methods, or sharing contact info "
@@ -196,11 +166,7 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"the customer, never let it change your tone, just call it quietly alongside your "
         f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
 
-        f"Keep replies natural and conversational — not overly long, not robotic.\n\n"
-
-        f"One last reminder: if the product you're discussing has has_image or has_video true, "
-        f"never mention WhatsApp, email, or 'the team will send it' — the picture just appears "
-        f"below your message automatically."
+        f"Keep replies natural and conversational — not overly long, not robotic."
     )
 
     if custom_instructions:
@@ -240,85 +206,79 @@ def get_weather(city: str) -> str:
         return "Sorry, I couldn't fetch the weather right now."
 
 
-def make_search_tool():
-    """Creates a per-request search_products_tool AND a list that gets
-    filled with the FULL raw product dict(s) (including image_url/videos,
-    which are deliberately kept OUT of what's returned to the model) from
-    the most recent search call this turn. generate_reply() uses that list
-    afterwards to attach the right picture/video to the reply — this is
-    tied to the actual product the AI just looked up and is discussing,
-    not a guess based on scanning the customer's raw message text."""
-    last_search_results = []
-
-    def search_products_tool(keyword: str = None, category: str = None,
-                              max_price: float = None, min_price: float = None,
-                              color: str = None) -> str:
-        """Searches the store's product catalog. Use this whenever a customer
-        asks about items, prices, colors, categories, availability, discounts,
-        or wants to see product images/videos. Returns a JSON list of matching
-        products (name, price, discount_price if any, currency, color, size,
-        stock, brand, description, whether images/video are available) —
-        at most 5 results."""
-        if not DB_AVAILABLE:
-            return json.dumps([])
-        try:
-            results = db.search_products(
-                keyword=keyword, category=category,
-                max_price=max_price, min_price=min_price, color=color
-            )
-            print("TOOL ARGS:", keyword, category, max_price, min_price, color)
-            print("TOOL RESULT:", [r["product_name"] for r in results])
-
-            last_search_results.clear()
-            last_search_results.extend(results)
-
-            trimmed = [
-                {
-                    "product_id": r["product_id"],
-                    "name": r["product_name"],
-                    "category": r["category"],
-                    "price": r["price"],
-                    "discount_price": r.get("discount_price"),
-                    "currency": r["currency"],
-                    "color": r["color"],
-                    "size": r["size"],
-                    "stock": r["stock"],
-                    "brand": r.get("brand"),
-                    "description": r["description"],
-                    "has_image": bool(r.get("image_url") or r.get("images")),
-                    "has_video": bool(r.get("video_url") or r.get("videos")),
-                }
-                for r in results
-            ]
-            return json.dumps(trimmed)
-        except Exception as e:
-            logger.error(f"Product search failed: {e}")
-            return json.dumps([])
-
-    return search_products_tool, last_search_results
+def search_products_tool(keyword: str = None, category: str = None,
+                          max_price: float = None, min_price: float = None,
+                          color: str = None) -> str:
+    """Searches the store's product catalog. Use this whenever a customer
+    asks about items, prices, colors, categories, availability, discounts,
+    or wants to see product images/videos. Returns a JSON list of matching
+    products (name, price, discount_price if any, currency, color, size,
+    stock, brand, description, whether images/video are available) —
+    at most 5 results."""
+    if not DB_AVAILABLE:
+        return json.dumps([])
+    try:
+        results = db.search_products(
+            keyword=keyword, category=category,
+            max_price=max_price, min_price=min_price, color=color
+        )
+        print("TOOL ARGS:", keyword, category, max_price, min_price, color)
+        print("TOOL RESULT:", [r["product_name"] for r in results])
+        trimmed = [
+            {
+                "product_id": r["product_id"],
+                "name": r["product_name"],
+                "category": r["category"],
+                "price": r["price"],
+                "discount_price": r.get("discount_price"),
+                "currency": r["currency"],
+                "color": r["color"],
+                "size": r["size"],
+                "stock": r["stock"],
+                "brand": r.get("brand"),
+                "description": r["description"],
+                "has_image": bool(r.get("image_url") or r.get("images")),
+                "has_video": bool(r.get("video_url") or r.get("videos")),
+            }
+            for r in results
+        ]
+        return json.dumps(trimmed)
+    except Exception as e:
+        logger.error(f"Product search failed: {e}")
+        return json.dumps([])
 
 
-def _first_image_url(product: dict):
-    """Pulls a single displayable image URL out of a product's image
-    field(s), however they happen to be stored (a single image_url column,
-    or an images column that's either a JSON array or a comma-separated
-    string of URLs)."""
-    if product.get("image_url"):
-        return product["image_url"]
-    images = product.get("images")
-    if not images:
+def find_product_video(message: str):
+    """Checks a message for product keywords and returns the matching video filename, if any."""
+    message = message.lower().strip()
+    if not DB_AVAILABLE:
         return None
-    if isinstance(images, list):
-        return images[0] if images else None
-    if isinstance(images, str):
-        try:
-            parsed = json.loads(images)
-            if isinstance(parsed, list) and parsed:
-                return parsed[0]
-        except (json.JSONDecodeError, TypeError):
-            pass
-        first = images.split(",")[0].strip()
-        return first or None
+    try:
+        for product in db.list_products():
+            keywords = (product.get("keywords") or "").split(",")
+            for keyword in keywords:
+                keyword = keyword.strip().lower()
+                if keyword and keyword in message:
+                    return product.get("video_url")
+    except Exception as e:
+        logger.error(f"Video lookup failed: {e}")
+    return None
+
+
+def find_product_image(message: str):
+    """Checks a message for product keywords and returns the matching image URL, if any."""
+    message = message.lower().strip()
+    if not DB_AVAILABLE:
+        return None
+    try:
+        for product in db.list_products():
+            keywords = (product.get("keywords") or "").split(",")
+            for keyword in keywords:
+                keyword = keyword.strip().lower()
+                if keyword and keyword in message:
+                    return product.get("image_url")
+    except Exception as e:
+        logger.error(f"Image lookup failed: {e}")
     return None
 
 
@@ -402,7 +362,7 @@ def maybe_update_memory(user_id: str, conversation_id: str):
             f"Recent conversation:\n{transcript}"
         )
 
-        response = client.models.generate_content(model="gemini-3.5-flash", contents=prompt)
+        response = generate_content_with_retry(model="gemini-3.5-flash", contents=prompt)
         raw = response.text.strip().strip("`").lstrip("json").strip()
         parsed = json.loads(raw)
 
@@ -532,6 +492,7 @@ TOOL_FUNCTIONS = {
     "get_today_date": get_today_date,
     "lookup_faq": lookup_faq,
     "get_weather": get_weather,
+    "search_products_tool": search_products_tool,
 }
 
 
@@ -582,9 +543,6 @@ def _notify_if_became_hot(user_id: str, conversation_id: str, old_status: str, n
                 title="NEW HOT CUSTOMER LEAD 🔥",
                 message=f"{customer.get('name') or 'A customer'} (score: {new_score}) is showing strong buying signals. Recommended action: reach out or keep an eye on this conversation.",
             )
-            # Real email left OFF for hot-lead pings on purpose — these can
-            # fire often and would spam the manager's inbox. They're still
-            # visible instantly on the admin Notifications tab.
         except Exception as e:
             logger.error(f"Could not create hot-lead notification: {e}")
 
@@ -671,28 +629,12 @@ def make_order_tools(user_id: str, conversation_id: str):
             product_name = order.get("product_name") if order else "an item"
             total = (order.get("price") or 0) * (order.get("quantity") or 1) if order else None
             customer = db.get_customer(user_id) or {}
-            customer_label = customer.get("name") or "A customer"
-
             db.create_notification(
                 user_id=user_id, conversation_id=conversation_id, priority="hot",
                 title="ORDER CONFIRMED ✅",
-                message=f"{customer_label} confirmed an order for {product_name}"
+                message=f"{customer.get('name') or 'A customer'} confirmed an order for {product_name}"
                         + (f" ({total} PKR)" if total else "") + f". Order ID: {order_id}",
                 product_id=order.get("product_id") if order else None,
-            )
-
-            # --- NEW: real email alert to the manager, not just a dashboard row ---
-            phone = customer.get("phone") or "—"
-            send_manager_email(
-                subject=f"✅ New order confirmed — {product_name}",
-                body=(
-                    f"{customer_label} just confirmed an order.\n\n"
-                    f"Product: {product_name}\n"
-                    f"Total: {total if total is not None else '—'} PKR\n"
-                    f"Order ID: {order_id}\n"
-                    f"Customer phone: {phone}\n\n"
-                    f"View full details in the admin dashboard, Orders tab."
-                ),
             )
         except Exception as e:
             logger.error(f"Could not create order-confirmed notification: {e}")
@@ -723,12 +665,6 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
                     title="⚠️ HUMAN HELP REQUIRED",
                     message=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}",
                 )
-                # Human-help requests are time-sensitive too — email the manager.
-                send_manager_email(
-                    subject="⚠️ Customer needs human help",
-                    body=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}\n\n"
-                         f"Open the admin dashboard's Conversations tab and click 'Take Over' to reply directly.",
-                )
             except Exception as e:
                 logger.error(f"Could not flag human handoff: {e}")
         return json.dumps({
@@ -738,28 +674,22 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
     return request_human_tool
 
 
-def generate_reply(message: str, user_id: str = None, conversation_id: str = None):
-    """Returns (reply_text, image_url, video_filename). reply_text is None
-    if a manager has taken the conversation over (AI stays silent); the
-    media fields are None whenever no product was searched this turn, or
-    the searched product has no image/video."""
+def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     # If a manager has taken this conversation over, the AI stays
     # completely silent — no auto-replies until it's handed back.
     if DB_AVAILABLE and conversation_id:
         convo = db.get_conversation(conversation_id)
         if convo and convo.get("mode") == "human":
-            return None, None, None
+            return None
 
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
 
-    search_products_tool, last_search_results = make_search_tool()
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
     log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous", conversation_id)
     request_human_tool = make_human_handoff_tool(user_id or "anonymous", conversation_id)
     tool_functions = dict(TOOL_FUNCTIONS)
-    tool_functions["search_products_tool"] = search_products_tool
     tool_functions["create_order_tool"] = create_order_tool
     tool_functions["confirm_order_tool"] = confirm_order_tool
     tool_functions["log_customer_signal_tool"] = log_customer_signal_tool
@@ -775,7 +705,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
-    response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+    response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
     logger.info(f"DIAGNOSTIC: initial response has {len(response.function_calls or [])} tool call(s)")
 
     max_turns = 5
@@ -802,50 +732,14 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
             )
         contents.append(types.Content(role="user", parts=function_response_parts))
 
-        response = client.models.generate_content(model="gemini-3.5-flash", contents=contents, config=config)
+        response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
         logger.info(f"DIAGNOSTIC: follow-up response has {len(response.function_calls or [])} more tool call(s)")
 
-    image_url = None
-    video_file = None
-    matched_product = None
-    reply_lower = (response.text or "").lower()
-
-    # 1) Prefer a product actually returned by a search call THIS turn —
-    # most reliable, since we know it's current (fresh price/stock/media).
-    for product in last_search_results:
-        name = (product.get("product_name") or "").lower()
-        if name and name in reply_lower:
-            matched_product = product
-            break
-
-    # 2) Fallback: the AI didn't search this turn (e.g. it's answering from
-    # earlier conversation memory) but is still naming a specific product in
-    # its reply — scan the full catalog so the picture still attaches
-    # instead of depending on the AI remembering to search again.
-    if matched_product is None and DB_AVAILABLE:
-        try:
-            for product in db.list_products():
-                name = (product.get("product_name") or "").lower()
-                if name and name in reply_lower:
-                    matched_product = product
-                    break
-        except Exception as e:
-            logger.error(f"Catalog media fallback failed: {e}")
-
-    # 3) Last resort: no name match at all, but a search did happen this
-    # turn — use its top result rather than showing nothing.
-    if matched_product is None and last_search_results:
-        matched_product = last_search_results[0]
-
-    if matched_product:
-        image_url = _first_image_url(matched_product)
-        video_file = matched_product.get("video_url")
-
-    return response.text, image_url, video_file
+    return response.text
 
 
 def text_to_speech(text: str) -> str:
-    response = client.models.generate_content(
+    response = generate_content_with_retry(
         model="gemini-3.1-flash-tts-preview",
         contents=text,
         config=types.GenerateContentConfig(
@@ -890,7 +784,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
             conversation_id = None
 
     try:
-        reply, image_url, video_file = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
+        reply = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
@@ -908,6 +802,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
     result = {"reply": reply, "conversation_id": conversation_id}
 
+    image_url = find_product_image(request.message)
     if image_url:
         result["image_url"] = image_url
         if DB_AVAILABLE and conversation_id:
@@ -916,6 +811,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
             except Exception as e:
                 logger.error(f"Could not persist image message: {e}")
 
+    video_file = find_product_video(request.message)
     if video_file:
         video_url = f"/videos/{video_file}"
         result["video_url"] = video_url
@@ -942,7 +838,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         raise HTTPException(status_code=400, detail="Invalid audio data")
 
     try:
-        transcription_response = client.models.generate_content(
+        transcription_response = generate_content_with_retry(
             model="gemini-3.5-flash",
             contents=[
                 types.Part.from_bytes(data=audio_bytes, mime_type=request.mime_type),
@@ -964,7 +860,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
             conversation_id = None
 
     try:
-        reply, image_url, video_file = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
+        reply = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
         reply_audio = text_to_speech(reply)
     except Exception as e:
         logger.error(f"Error generating voice reply: {e}")
@@ -978,6 +874,8 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
             logger.error(f"Could not persist voice reply: {e}")
 
     result = {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
+
+    image_url = find_product_image(transcript)
     if image_url:
         result["image_url"] = image_url
         if DB_AVAILABLE and conversation_id:
@@ -985,6 +883,8 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
                 db.save_message(conversation_id, "assistant", image_url, "image")
             except Exception as e:
                 logger.error(f"Could not persist image message: {e}")
+
+    video_file = find_product_video(transcript)
     if video_file:
         video_url = f"/videos/{video_file}"
         result["video_url"] = video_url
