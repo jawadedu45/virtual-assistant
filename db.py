@@ -412,43 +412,99 @@ def get_product(product_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+# ---------------------------------------------------------------------------
+# Product search (improved: spelling synonyms + step-by-step fallback)
+# ---------------------------------------------------------------------------
+
+# Words that mean the same thing for your store. Add more any time.
+_SYNONYM_GROUPS = [
+    ["waistcoat", "waist coat", "westcoat", "west coat", "wescoat", "vest", "koti"],
+]
+
+
+def _expand_terms(term: str) -> list[str]:
+    """'Waistcoats' -> ['waistcoat', 'waist coat', 'westcoat', ...]"""
+    t = term.lower().strip()
+    singular = t[:-1] if t.endswith("s") and len(t) > 3 else t
+    for group in _SYNONYM_GROUPS:
+        if t in group or singular in group:
+            return group
+    return [singular]
+
+
+def _text_clause(terms: list[str]):
+    """Match any of the terms in name, category, description or keywords."""
+    columns = ["product_name", "category", "description", "keywords"]
+    parts, params = [], []
+    for term in terms:
+        for col in columns:
+            parts.append(f"LOWER(COALESCE({col}, '')) LIKE ?")
+            params.append(f"%{term}%")
+    return "(" + " OR ".join(parts) + ")", params
+
+
 def search_products(business_id: str = DEFAULT_BUSINESS_ID, keyword: str = None,
                      category: str = None, max_price: float = None,
                      min_price: float = None, color: str = None,
                      in_stock_only: bool = True, limit: int = 5) -> list[dict]:
-    query = "SELECT * FROM products WHERE business_id = ?"
-    params = [business_id]
 
-    if keyword:
-        query += """ AND (
-            LOWER(product_name) LIKE ? OR
-            LOWER(description) LIKE ? OR
-            LOWER(category) LIKE ? OR
-            LOWER(keywords) LIKE ?
-        )"""
-        like = f"%{keyword.lower()}%"
-        params += [like, like, like, like]
-    if category:
-        query += " AND LOWER(category) LIKE ?"
-        params.append(f"%{category.lower()}%")
+    def run(use_color: bool, use_price: bool) -> list[dict]:
+        query = "SELECT * FROM products WHERE business_id = ?"
+        params = [business_id]
+
+        # keyword and category are both treated as "what is the customer looking for"
+        for text in (keyword, category):
+            if text:
+                clause, p = _text_clause(_expand_terms(text))
+                query += f" AND {clause}"
+                params += p
+
+        if use_color and color:
+            color_parts, color_params = [], []
+            for c in _expand_terms(color):
+                color_parts.append("LOWER(COALESCE(color, '')) LIKE ?")
+                color_params.append(f"%{c}%")
+            query += " AND (" + " OR ".join(color_parts) + ")"
+            params += color_params
+
+        if use_price:
+            if max_price is not None:
+                query += " AND price <= ?"
+                params.append(max_price)
+            if min_price is not None:
+                query += " AND price >= ?"
+                params.append(min_price)
+
+        if in_stock_only:
+            query += " AND stock > 0"
+
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+
+        with get_conn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # 1) exact search with everything the customer asked for
+    results = run(use_color=True, use_price=True)
+    if results:
+        return results
+
+    # 2) nothing found -> drop the colour filter. The results still show each
+    #    product's real colours, so the assistant can say "not in black, but
+    #    available in ..." honestly.
     if color:
-        query += " AND LOWER(color) LIKE ?"
-        params.append(f"%{color.lower()}%")
-    if max_price is not None:
-        query += " AND price <= ?"
-        params.append(max_price)
-    if min_price is not None:
-        query += " AND price >= ?"
-        params.append(min_price)
-    if in_stock_only:
-        query += " AND stock > 0"
+        results = run(use_color=False, use_price=True)
+        if results:
+            return results
 
-    query += " ORDER BY updated_at DESC LIMIT ?"
-    params.append(limit)
+    # 3) still nothing -> drop the price filter too
+    if color or max_price is not None or min_price is not None:
+        results = run(use_color=False, use_price=False)
+        if results:
+            return results
 
-    with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
+    return []
 
 
 def add_product(business_id: str = DEFAULT_BUSINESS_ID, **fields) -> str:

@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
-from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from datetime import date
@@ -21,34 +20,12 @@ import time
 import random
 
 import db
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(_name_)
-
-
-def generate_content_with_retry(model: str, contents, config=None, max_retries: int = 3):
-    """Wraps client.models.generate_content with retry + backoff for
-    transient errors (503 UNAVAILABLE, 429 rate limit, etc). Gemini's
-    -flash models occasionally return these under load; retrying after
-    a short wait usually succeeds within a couple of tries."""
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            if config is not None:
-                return client.models.generate_content(model=model, contents=contents, config=config)
-            return client.models.generate_content(model=model, contents=contents)
-        except Exception as e:
-            last_error = e
-            error_str = str(e)
-            is_transient = "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-            if not is_transient or attempt == max_retries - 1:
-                raise
-            wait_time = (2 ** attempt) + random.uniform(0, 1)
-            logger.warning(f"Transient error on attempt {attempt + 1}/{max_retries}, retrying in {wait_time:.1f}s: {e}")
-            time.sleep(wait_time)
-    raise last_error
+import llm  # all AI calls (Groq first, Gemini as backup) live in llm.py
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -62,7 +39,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 CUSTOMER_API_KEY = os.getenv("CUSTOMER_API_KEY")
 
@@ -108,7 +84,7 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
 
     prompt = (
         f"You are {ai_name}, an AI sales assistant for {business_name}, built by Jawad — "
-        f"not by Google or any other company. If asked who made you, who you work for, or "
+        f"not by Google, Meta or any other company. If asked who made you, who you work for, or "
         f"what you are, always say you were built by Jawad.\n\n"
 
         f"PERSONALITY: Your tone is {personality_desc}.\n\n"
@@ -129,7 +105,7 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"the customer, suggest a complementary or upgraded item (upsell/cross-sell), but only "
         f"when it's a natural fit, not forced into every message.\n\n"
 
-        f"GROUNDING — CRITICAL: You can look up real products using the search_products tool. "
+        f"GROUNDING — CRITICAL: You can look up real products using the search_products_tool tool. "
         f"Only ever mention products, prices, colors, sizes, discounts, or stock levels that "
         f"actually came back from that tool. Never invent or guess product details. If the "
         f"customer asks about something not in the catalog or something you're not sure about, "
@@ -166,7 +142,8 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"the customer, never let it change your tone, just call it quietly alongside your "
         f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
 
-        f"Keep replies natural and conversational — not overly long, not robotic."
+        f"Keep replies natural and conversational — not overly long, not robotic. "
+        f"Never write tool names, JSON, or function-call syntax in your reply to the customer."
     )
 
     if custom_instructions:
@@ -322,15 +299,17 @@ def build_memory_context(user_id: str) -> str:
 
 
 def build_recent_history(conversation_id: str):
+    """Last few messages as [{"role": "user"|"assistant", "content": "..."}].
+    llm.py converts this to Groq or Gemini format as needed."""
     if not DB_AVAILABLE or not conversation_id:
         return []
     try:
-        recent = db.get_recent_messages(conversation_id, limit=12)
-        history = []
-        for m in recent:
-            role = "user" if m["sender"] == "user" else "model"
-            history.append(types.Content(role=role, parts=[types.Part(text=m["message"])]))
-        return history
+        recent = db.get_recent_messages(conversation_id, limit=10)
+        return [
+            {"role": "user" if m["sender"] == "user" else "assistant", "content": m["message"]}
+            for m in recent
+            if m.get("message")
+        ]
     except Exception as e:
         logger.error(f"History lookup failed: {e}")
         return []
@@ -362,8 +341,10 @@ def maybe_update_memory(user_id: str, conversation_id: str):
             f"Recent conversation:\n{transcript}"
         )
 
-        response = generate_content_with_retry(model="gemini-3.5-flash", contents=prompt)
-        raw = response.text.strip().strip("`").lstrip("json").strip()
+        raw = llm.generate_text(prompt, json_mode=True).strip()
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
         parsed = json.loads(raw)
 
         db.upsert_memory(
@@ -462,7 +443,12 @@ def ensure_conversation(user_id: str, conversation_id: Optional[str]) -> str:
 
 @app.get("/api/status")
 def read_root():
-    return {"message": "Hello, your server is running!", "database": DB_AVAILABLE}
+    return {
+        "message": "Hello, your server is running!",
+        "database": DB_AVAILABLE,
+        "groq": bool(llm.groq_client),
+        "gemini": bool(llm.gemini_client),
+    }
 
 
 @app.get("/settings")
@@ -674,6 +660,56 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
     return request_human_tool
 
 
+# --- Tool descriptions for Groq (Gemini reads them from the Python functions) ---
+def _tool(name, description, properties=None, required=None):
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": properties or {}, "required": required or []},
+    }}
+
+
+TOOL_SCHEMAS = [
+    _tool("get_today_date", "Returns today's date."),
+    _tool("lookup_faq", "Looks up an answer to a common store question (shipping, returns, etc.).",
+          {"question": {"type": "string"}}, ["question"]),
+    _tool("get_weather", "Gets the current weather for a city.",
+          {"city": {"type": "string"}}, ["city"]),
+    _tool("search_products_tool",
+          "Searches the store's product catalog. Use whenever a customer asks about items, prices, "
+          "colors, categories, availability or discounts. Returns at most 5 products.",
+          {"keyword": {"type": "string", "description": "e.g. waistcoat, cap, kids suit"},
+           "category": {"type": "string"},
+           "max_price": {"type": "number"},
+           "min_price": {"type": "number"},
+           "color": {"type": "string"}}),
+    _tool("create_order_tool",
+          "Creates a PENDING order once the customer decided to buy. product_id must come from "
+          "search_products_tool. Does NOT confirm the order.",
+          {"product_id": {"type": "string"},
+           "color": {"type": "string"},
+           "size": {"type": "string"},
+           "quantity": {"type": "integer"},
+           "customer_name": {"type": "string"},
+           "customer_phone": {"type": "string"},
+           "delivery_address": {"type": "string"},
+           "payment_method": {"type": "string"}},
+          ["product_id"]),
+    _tool("confirm_order_tool",
+          "Call ONLY after the customer explicitly confirmed the order summary.",
+          {"order_id": {"type": "string"}}, ["order_id"]),
+    _tool("log_customer_signal_tool",
+          "Silently log a buying-interest signal. Not for greetings or small talk.",
+          {"signal": {"type": "string",
+                      "enum": ["asked_price", "asked_stock", "asked_delivery",
+                               "asked_payment", "provided_contact_info"]}},
+          ["signal"]),
+    _tool("request_human_tool",
+          "Flag the chat for a human when the customer asks for a real person, has a complaint, "
+          "or needs something you can't do.",
+          {"reason": {"type": "string"}}, ["reason"]),
+]
+
+
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     # If a manager has taken this conversation over, the AI stays
     # completely silent — no auto-replies until it's handed back.
@@ -696,72 +732,56 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     tool_functions["request_human_tool"] = request_human_tool
 
     history = build_recent_history(conversation_id) if conversation_id else []
-    contents = list(history) if history else [types.Content(role="user", parts=[types.Part(text=message)])]
+    if not history or history[-1]["role"] != "user":
+        history.append({"role": "user", "content": message})
 
-    config = types.GenerateContentConfig(
-        system_instruction=full_system_prompt,
-        tools=[get_today_date, lookup_faq, get_weather, search_products_tool,
-               create_order_tool, confirm_order_tool, log_customer_signal_tool, request_human_tool],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    tool_callables = [get_today_date, lookup_faq, get_weather, search_products_tool,
+                      create_order_tool, confirm_order_tool, log_customer_signal_tool,
+                      request_human_tool]
+
+    return llm.chat_with_tools(
+        system_prompt=full_system_prompt,
+        history=history,
+        tool_schemas=TOOL_SCHEMAS,
+        tool_callables=tool_callables,
+        tool_functions=tool_functions,
     )
-
-    response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
-    logger.info(f"DIAGNOSTIC: initial response has {len(response.function_calls or [])} tool call(s)")
-
-    max_turns = 5
-    turns = 0
-    while response.function_calls and turns < max_turns:
-        turns += 1
-        contents.append(response.candidates[0].content)
-
-        function_response_parts = []
-        for fc in response.function_calls:
-            logger.info(f"DIAGNOSTIC: model called tool '{fc.name}' with args {fc.args}")
-            func = tool_functions.get(fc.name)
-            if func:
-                try:
-                    result = func(**(fc.args or {}))
-                    logger.info(f"DIAGNOSTIC: tool '{fc.name}' returned: {result[:500]}")
-                except Exception as e:
-                    logger.error(f"Tool '{fc.name}' failed: {e}")
-                    result = f"Error running {fc.name}: {e}"
-            else:
-                result = f"Unknown tool: {fc.name}"
-            function_response_parts.append(
-                types.Part.from_function_response(name=fc.name, response={"result": result})
-            )
-        contents.append(types.Content(role="user", parts=function_response_parts))
-
-        response = generate_content_with_retry(model="gemini-3.5-flash", contents=contents, config=config)
-        logger.info(f"DIAGNOSTIC: follow-up response has {len(response.function_calls or [])} more tool call(s)")
-
-    return response.text
 
 
 def text_to_speech(text: str) -> str:
-    response = generate_content_with_retry(
-        model="gemini-3.1-flash-tts-preview",
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
-                )
-            ),
-        )
-    )
-    audio_data = response.candidates[0].content.parts[0].inline_data.data
+    """Voice replies use Gemini's text-to-speech. Raises if it fails;
+    the caller then sends the text reply without audio."""
+    if not llm.gemini_client:
+        raise RuntimeError("Gemini key not set - text-to-speech unavailable")
 
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(audio_data)
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = llm.gemini_client.models.generate_content(
+                model="gemini-3.1-flash-tts-preview",
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                        )
+                    ),
+                ),
+            )
+            audio_data = response.candidates[0].content.parts[0].inline_data.data
 
-    wav_bytes = buffer.getvalue()
-    return base64.b64encode(wav_bytes).decode("utf-8")
+            buffer = io.BytesIO()
+            with wave.open(buffer, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(audio_data)
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        except Exception as e:
+            last_error = e
+            time.sleep(1 + random.uniform(0, 1))
+    raise last_error
 
 
 @app.post("/chat")
@@ -838,14 +858,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         raise HTTPException(status_code=400, detail="Invalid audio data")
 
     try:
-        transcription_response = generate_content_with_retry(
-            model="gemini-3.5-flash",
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type=request.mime_type),
-                "Transcribe this audio to text. Reply with ONLY the transcribed text, nothing else."
-            ]
-        )
-        transcript = transcription_response.text.strip()
+        transcript = llm.transcribe_audio(audio_bytes, request.mime_type)
         logger.info(f"Voice transcript: {transcript}")
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
@@ -861,10 +874,19 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
 
     try:
         reply = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
-        reply_audio = text_to_speech(reply)
     except Exception as e:
         logger.error(f"Error generating voice reply: {e}")
         return {"transcript": transcript, "reply": "Sorry, I couldn't process that voice message."}
+
+    if reply is None:
+        return {"transcript": transcript, "reply": None, "conversation_id": conversation_id, "handed_off": True}
+
+    # If text-to-speech fails, the customer still gets the text reply.
+    reply_audio = None
+    try:
+        reply_audio = text_to_speech(reply)
+    except Exception as e:
+        logger.error(f"Text-to-speech failed, sending text only: {e}")
 
     if DB_AVAILABLE and conversation_id:
         try:

@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-google-genai
 python-dotenv
+pydantic
 scikit-learn
-turso-serverless
+groq
+google-genai
+turso-serverless==0.1.0
