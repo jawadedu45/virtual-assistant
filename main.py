@@ -153,7 +153,12 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"Only ever mention products, prices, colors, sizes, discounts, or stock levels that "
         f"actually came back from that tool. Never invent or guess product details. If the "
         f"customer asks about something not in the catalog or something you're not sure about, "
-        f"say so honestly and offer to have the team follow up — don't make something up.\n\n"
+        f"say so honestly and offer to have the team follow up — don't make something up. "
+        f"IMPORTANT: call search_products_tool again for a product any time you're actively "
+        f"discussing it with the customer — checking stock, confirming price, or mentioning a "
+        f"photo/video — even if you already searched for it earlier in this same conversation. "
+        f"Do not rely on what you remember from earlier messages for these details; only a fresh "
+        f"tool call tells you whether a photo or video is currently available to show.\n\n"
 
         f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
         f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
@@ -171,14 +176,18 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
         f"yes/confirm — never confirm an order the customer hasn't explicitly agreed to.\n\n"
 
-        f"MEDIA — CRITICAL: search_products_tool results include has_image and has_video flags. "
-        f"When a product you're discussing has has_image or has_video set to true, its actual "
-        f"photo or video is shown to the customer automatically, right in this chat, immediately "
-        f"after your reply — you do NOT send it and must NEVER claim you can't display pictures "
-        f"or offer to send it another way (WhatsApp, email, etc.) instead. Just say something "
-        f"natural like 'Here's a look at it 👇' or 'Take a look below' and it will appear on its "
-        f"own. Only offer an alternative like WhatsApp if has_image and has_video are BOTH false "
-        f"for that product — meaning no photo or video exists for it yet.\n\n"
+        f"MEDIA — HIGHEST PRIORITY RULE: This chat interface CAN and DOES show real photos and "
+        f"videos directly to the customer — you are NOT a text-only assistant here. Whenever "
+        f"search_products_tool returns has_image: true or has_video: true for a product you are "
+        f"discussing, the actual photo or video is displayed automatically, right in this chat, "
+        f"immediately below your reply. You are FORBIDDEN from saying any of the following when "
+        f"has_image or has_video is true for that product: 'I cannot show images', 'I'm a text "
+        f"assistant', 'I can't display pictures here', 'I'll have the team send it', 'I can send "
+        f"it to your WhatsApp', or anything with a similar meaning. Instead, simply say something "
+        f"short like 'Here's a look at it 👇' or 'Take a look below 👇' and STOP — do not mention "
+        f"WhatsApp, email, or any other delivery method at all. The only time you may offer an "
+        f"alternative like having the team follow up is when has_image AND has_video are BOTH "
+        f"false for that specific product — meaning no photo or video exists for it yet.\n\n"
 
         f"TRACKING INTEREST: Silently call log_customer_signal_tool whenever the customer's "
         f"message shows real buying interest — asking the price, asking if something's in "
@@ -187,7 +196,11 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"the customer, never let it change your tone, just call it quietly alongside your "
         f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
 
-        f"Keep replies natural and conversational — not overly long, not robotic."
+        f"Keep replies natural and conversational — not overly long, not robotic.\n\n"
+
+        f"One last reminder: if the product you're discussing has has_image or has_video true, "
+        f"never mention WhatsApp, email, or 'the team will send it' — the picture just appears "
+        f"below your message automatically."
     )
 
     if custom_instructions:
@@ -794,12 +807,39 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
     image_url = None
     video_file = None
-    if last_search_results:
-        # The top result of the most recent search this turn — the product
-        # the AI is actually discussing right now.
-        top_product = last_search_results[0]
-        image_url = _first_image_url(top_product)
-        video_file = top_product.get("video_url")
+    matched_product = None
+    reply_lower = (response.text or "").lower()
+
+    # 1) Prefer a product actually returned by a search call THIS turn —
+    # most reliable, since we know it's current (fresh price/stock/media).
+    for product in last_search_results:
+        name = (product.get("product_name") or "").lower()
+        if name and name in reply_lower:
+            matched_product = product
+            break
+
+    # 2) Fallback: the AI didn't search this turn (e.g. it's answering from
+    # earlier conversation memory) but is still naming a specific product in
+    # its reply — scan the full catalog so the picture still attaches
+    # instead of depending on the AI remembering to search again.
+    if matched_product is None and DB_AVAILABLE:
+        try:
+            for product in db.list_products():
+                name = (product.get("product_name") or "").lower()
+                if name and name in reply_lower:
+                    matched_product = product
+                    break
+        except Exception as e:
+            logger.error(f"Catalog media fallback failed: {e}")
+
+    # 3) Last resort: no name match at all, but a search did happen this
+    # turn — use its top result rather than showing nothing.
+    if matched_product is None and last_search_results:
+        matched_product = last_search_results[0]
+
+    if matched_product:
+        image_url = _first_image_url(matched_product)
+        video_file = matched_product.get("video_url")
 
     return response.text, image_url, video_file
 
