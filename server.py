@@ -9,8 +9,11 @@ from dotenv import load_dotenv
 from datetime import date
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from email.mime.text import MIMEText
 import urllib.request
+import smtplib
 import os
+import re
 import json
 import logging
 import base64
@@ -67,6 +70,57 @@ PERSONALITY_STYLES = {
     "simple": "plain, direct, and easy to follow — short sentences, no jargon, no fluff",
     "persuasive": "confident and compelling — skilled at highlighting value and gently guiding the customer toward a decision",
 }
+
+
+# =======================================================================
+# MANAGER EMAIL ALERTS
+# =======================================================================
+# Sends a real email to the manager, in addition to the dashboard
+# notification. Needs these environment variables (Vercel + local .env):
+#   MANAGER_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+# If any are missing it only logs a warning; the chatbot keeps working.
+def send_manager_email(subject: str, body: str):
+    try:
+        biz = db.get_business_settings() if DB_AVAILABLE else None
+        # Skip only if the owner switched notifications off.
+        if biz is not None and biz.get("notifications_enabled") == 0:
+            return
+
+        manager_email = os.getenv("MANAGER_EMAIL")
+        smtp_host = os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER")
+        smtp_pass = os.getenv("SMTP_PASS")
+
+        if not all([manager_email, smtp_host, smtp_user, smtp_pass]):
+            logger.warning(
+                "Manager email not sent - set MANAGER_EMAIL, SMTP_HOST, "
+                "SMTP_USER, SMTP_PASS in your environment variables."
+            )
+            return
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = manager_email
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as smtp:
+            smtp.starttls()
+            smtp.login(smtp_user, smtp_pass)
+            smtp.sendmail(smtp_user, [manager_email], msg.as_string())
+        logger.info(f"Manager email sent: {subject}")
+    except Exception as e:
+        logger.error(f"Manager email failed: {e}")
+
+
+def clean_reply(text: str) -> str:
+    """Removes markdown symbols the chat widget can't display."""
+    if not text:
+        return text
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"^\s*#+\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*•]\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
 
 
 def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
@@ -141,6 +195,14 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"unprompted. This is invisible bookkeeping for the sales team — never mention it to "
         f"the customer, never let it change your tone, just call it quietly alongside your "
         f"normal reply when it's genuinely relevant. Don't call it for greetings or small talk.\n\n"
+
+        f"AFTER AN ORDER: Once an order is confirmed, tell the customer the team has received it "
+        f"and will contact them on their phone number to arrange delivery. NEVER promise an SMS, "
+        f"email, WhatsApp message, tracking number or delivery date, because you cannot send those.\n\n"
+
+        f"FORMATTING: Write plain text only. Never use markdown: no asterisks (**), no # headings, "
+        f"no bullet symbols and no tables. Use short natural sentences and put a blank line "
+        f"between paragraphs.\n\n"
 
         f"Keep replies natural and conversational — not overly long, not robotic. "
         f"Never write tool names, JSON, or function-call syntax in your reply to the customer."
@@ -268,7 +330,7 @@ chunk_vectors = vectorizer.fit_transform(DOCUMENT_CHUNKS)
 
 
 def search_document(question: str) -> str:
-    """Searches Jawad's personal document for the chunk most relevant to a question."""
+    """Searches the background document for the chunk most relevant to a question."""
     question_vector = vectorizer.transform([question])
     similarities = cosine_similarity(question_vector, chunk_vectors)[0]
     best_index = similarities.argmax()
@@ -526,6 +588,8 @@ def _notify_if_became_hot(user_id: str, conversation_id: str, old_status: str, n
                 title="NEW HOT CUSTOMER LEAD 🔥",
                 message=f"{customer.get('name') or 'A customer'} (score: {new_score}) is showing strong buying signals. Recommended action: reach out or keep an eye on this conversation.",
             )
+            # Email is intentionally NOT sent for hot-lead pings (could spam
+            # the manager). They show instantly on the dashboard instead.
         except Exception as e:
             logger.error(f"Could not create hot-lead notification: {e}")
 
@@ -612,12 +676,33 @@ def make_order_tools(user_id: str, conversation_id: str):
             product_name = order.get("product_name") if order else "an item"
             total = (order.get("price") or 0) * (order.get("quantity") or 1) if order else None
             customer = db.get_customer(user_id) or {}
+            customer_label = customer.get("name") or "A customer"
+
             db.create_notification(
                 user_id=user_id, conversation_id=conversation_id, priority="hot",
                 title="ORDER CONFIRMED ✅",
-                message=f"{customer.get('name') or 'A customer'} confirmed an order for {product_name}"
+                message=f"{customer_label} confirmed an order for {product_name}"
                         + (f" ({total} PKR)" if total else "") + f". Order ID: {order_id}",
                 product_id=order.get("product_id") if order else None,
+            )
+
+            # Real email alert to the manager (not just a dashboard row)
+            phone = (order.get("customer_phone") if order else None) or customer.get("phone") or "-"
+            address = (order.get("delivery_address") if order else None) or "-"
+            send_manager_email(
+                subject=f"New order confirmed - {product_name}",
+                body=(
+                    f"{customer_label} just confirmed an order.\n\n"
+                    f"Product: {product_name}\n"
+                    f"Size: {(order.get('size') if order else None) or '-'}\n"
+                    f"Quantity: {(order.get('quantity') if order else None) or '-'}\n"
+                    f"Total: {total if total is not None else '-'} PKR\n"
+                    f"Customer phone: {phone}\n"
+                    f"Delivery address: {address}\n"
+                    f"Order ID: {order_id}\n\n"
+                    f"Please contact the customer to arrange delivery. "
+                    f"Full details are in the admin dashboard, Orders tab."
+                ),
             )
         except Exception as e:
             logger.error(f"Could not create order-confirmed notification: {e}")
@@ -647,6 +732,12 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
                     user_id=user_id, conversation_id=conversation_id, priority="human_help",
                     title="⚠️ HUMAN HELP REQUIRED",
                     message=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}",
+                )
+                # Human-help requests are time-sensitive: email the manager too.
+                send_manager_email(
+                    subject="Customer needs human help",
+                    body=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}\n\n"
+                         f"Open the admin dashboard's Conversations tab and click 'Take Over' to reply directly.",
                 )
             except Exception as e:
                 logger.error(f"Could not flag human handoff: {e}")
@@ -736,13 +827,14 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
                       create_order_tool, confirm_order_tool, log_customer_signal_tool,
                       request_human_tool]
 
-    return llm.chat_with_tools(
+    reply = llm.chat_with_tools(
         system_prompt=full_system_prompt,
         history=history,
         tool_schemas=TOOL_SCHEMAS,
         tool_callables=tool_callables,
         tool_functions=tool_functions,
     )
+    return clean_reply(reply)
 
 
 def text_to_speech(text: str) -> str:
