@@ -260,10 +260,7 @@ def find_product_image(message: str):
 
 
 DOCUMENT_CHUNKS = [
-    "My name is Jawad Ahmad, a student at Malakand University.",
-    "I study bioinformatics with a focus on research.",
-    "I love playing cricket in my free time.",
-    "I enjoy programming and building projects like this assistant.",
+    "This store sells premium fabrics and westcoats.",
 ]
 
 vectorizer = TfidfVectorizer()
