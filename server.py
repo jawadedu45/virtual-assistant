@@ -357,6 +357,13 @@ def build_memory_context(user_id: str) -> str:
         return ""
 
 
+def is_garbled(text: str) -> bool:
+    """True if a reply looks like the '... ... ...' repetition glitch."""
+    if not text:
+        return False
+    return text.count("...") + text.count("…") >= 5
+
+
 def build_recent_history(conversation_id: str):
     """Last few messages as [{"role": "user"|"assistant", "content": "..."}].
     llm.py converts this to Groq or Gemini format as needed."""
@@ -368,6 +375,7 @@ def build_recent_history(conversation_id: str):
             {"role": "user" if m["sender"] == "user" else "assistant", "content": m["message"]}
             for m in recent
             if m.get("message")
+            and not (m["sender"] != "user" and is_garbled(m["message"]))
         ]
     except Exception as e:
         logger.error(f"History lookup failed: {e}")
