@@ -234,6 +234,11 @@ def _run_gemini(model, system_prompt, history, tool_callables, run_tool, max_tur
 # --------------------------------------------------------------------------
 # Public functions used by server.py
 # --------------------------------------------------------------------------
+def _is_garbled(text):
+    """True if a reply looks like the '... ... ...' repetition glitch."""
+    return text.count("...") + text.count("…") >= 5
+
+
 def chat_with_tools(system_prompt, history, tool_schemas, tool_callables, tool_functions, max_turns=5):
     """Get the chatbot's reply. history = [{"role": "user"|"assistant", "content": "..."}]"""
     run_tool = make_tool_runner(tool_functions)
@@ -247,6 +252,8 @@ def chat_with_tools(system_prompt, history, tool_schemas, tool_callables, tool_f
             else:
                 text = _run_gemini(model, system_prompt, history, tool_callables, run_tool, max_turns)
             if text and text.strip():
+                if _is_garbled(text):
+                    raise ValueError("garbled reply")
                 logger.info(f"Reply produced by {provider}/{model}")
                 return text
             raise ValueError("empty reply")
