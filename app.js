@@ -67,6 +67,17 @@ function addImageBubble(imageUrl) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// Shows one picture for every product in the reply (image_urls), or the
+// single image_url if the server only sent one.
+function showImages(data) {
+  const urls = data.image_urls && data.image_urls.length
+    ? data.image_urls
+    : (data.image_url ? [data.image_url] : []);
+  for (const url of urls) {
+    addImageBubble(url);
+  }
+}
+
 function showTyping() {
   const typing = document.createElement('div');
   typing.className = 'typing';
@@ -154,9 +165,7 @@ async function sendMessage() {
       return;
     }
     addBubble(data.reply, 'bot');
-    if (data.image_url) {
-      addImageBubble(data.image_url);
-    }
+    showImages(data);
     if (data.video_url) {
       addVideoBubble(data.video_url);
     }
@@ -221,9 +230,7 @@ async function sendVoiceMessage(audioBlob) {
       setConversationId(data.conversation_id);
       if (data.transcript) addBubble(data.transcript, 'user');
       addBubble(data.reply, 'bot');
-      if (data.image_url) {
-        addImageBubble(data.image_url);
-      }
+      showImages(data);
       if (data.video_url) {
         addVideoBubble(data.video_url);
       }

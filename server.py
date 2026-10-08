@@ -171,7 +171,9 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
         f"result shows has_image as true, just say the picture will appear right here in the "
         f"chat (it's shown automatically below your message) — don't describe sending it "
         f"anywhere. If has_image is false, say honestly that no photo is available for that "
-        f"item.\n\n"
+        f"item. Pictures are attached automatically by product name, so whenever you mention a "
+        f"product, write its exact name from the search results (for example 'Black Waistcoat' "
+        f"or 'Black 3-Piece Suit for Children') instead of rephrasing it.\n\n"
 
         f"HUMAN HANDOFF: If the customer explicitly asks to speak to a real person, asks for "
         f"a phone call, has a complaint, needs a discount or exception you can't authorize, or "
@@ -326,6 +328,40 @@ def find_product_image(message: str):
     except Exception as e:
         logger.error(f"Image lookup failed: {e}")
         return None
+
+
+def find_reply_images(reply: str, message: str, limit: int = 4):
+    """Returns the image URLs of every product the bot's reply names (up to
+    `limit`), so the customer sees a picture for each recommended product.
+    If the reply names none, falls back to the best match for the customer's
+    own message."""
+    if not DB_AVAILABLE:
+        return []
+    try:
+        remaining = (reply or "").lower()
+        products = [p for p in db.list_products()
+                    if p.get("image_url") and (p.get("product_name") or "").strip()]
+        # Longest names first, and remove each match from the text, so that
+        # "Black Waistcoat" is not counted when only "Black Waistcoat V Shape"
+        # was mentioned.
+        products.sort(key=lambda p: len(p["product_name"]), reverse=True)
+        found = []
+        for product in products:
+            name = product["product_name"].strip().lower()
+            if name in remaining:
+                remaining = remaining.replace(name, " ")
+                found.append((reply.lower().find(name), product["image_url"]))
+        found.sort(key=lambda item: item[0])  # same order as in the reply
+        urls = []
+        for _, url in found:
+            if url not in urls:
+                urls.append(url)
+        if urls:
+            return urls[:limit]
+    except Exception as e:
+        logger.error(f"Reply image lookup failed: {e}")
+    fallback = find_product_image(message)
+    return [fallback] if fallback else []
 
 
 DOCUMENT_CHUNKS = [
@@ -926,14 +962,16 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
     result = {"reply": reply, "conversation_id": conversation_id}
 
-    image_url = find_product_image(request.message)
-    if image_url:
-        result["image_url"] = image_url
+    image_urls = find_reply_images(reply, request.message)
+    if image_urls:
+        result["image_urls"] = image_urls
+        result["image_url"] = image_urls[0]  # kept for older widget versions
         if DB_AVAILABLE and conversation_id:
-            try:
-                db.save_message(conversation_id, "assistant", image_url, "image")
-            except Exception as e:
-                logger.error(f"Could not persist image message: {e}")
+            for image_url in image_urls:
+                try:
+                    db.save_message(conversation_id, "assistant", image_url, "image")
+                except Exception as e:
+                    logger.error(f"Could not persist image message: {e}")
 
     video_file = find_product_video(request.message)
     if video_file:
@@ -1001,14 +1039,16 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
 
     result = {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
 
-    image_url = find_product_image(transcript)
-    if image_url:
-        result["image_url"] = image_url
+    image_urls = find_reply_images(reply, transcript)
+    if image_urls:
+        result["image_urls"] = image_urls
+        result["image_url"] = image_urls[0]  # kept for older widget versions
         if DB_AVAILABLE and conversation_id:
-            try:
-                db.save_message(conversation_id, "assistant", image_url, "image")
-            except Exception as e:
-                logger.error(f"Could not persist image message: {e}")
+            for image_url in image_urls:
+                try:
+                    db.save_message(conversation_id, "assistant", image_url, "image")
+                except Exception as e:
+                    logger.error(f"Could not persist image message: {e}")
 
     video_file = find_product_video(transcript)
     if video_file:
