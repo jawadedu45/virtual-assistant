@@ -305,20 +305,27 @@ def find_product_video(message: str):
 
 
 def find_product_image(message: str):
-    """Checks a message for product keywords and returns the matching image URL, if any."""
+    """Returns the image of the product whose name/keywords best match the message."""
     message = message.lower().strip()
     if not DB_AVAILABLE:
         return None
     try:
+        best_product, best_score = None, 0
         for product in db.list_products():
-            keywords = (product.get("keywords") or "").split(",")
-            for keyword in keywords:
+            score = 0
+            name = (product.get("product_name") or "").lower()
+            if name and name in message:
+                score += 20
+            for keyword in (product.get("keywords") or "").split(","):
                 keyword = keyword.strip().lower()
                 if keyword and keyword in message:
-                    return product.get("image_url")
+                    score += len(keyword)
+            if score > best_score:
+                best_product, best_score = product, score
+        return best_product.get("image_url") if best_product else None
     except Exception as e:
         logger.error(f"Image lookup failed: {e}")
-    return None
+        return None
 
 
 DOCUMENT_CHUNKS = [
