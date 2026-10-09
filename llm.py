@@ -296,18 +296,47 @@ def generate_text(prompt, json_mode=False):
     raise RuntimeError("All AI providers failed -> " + " | ".join(errors))
 
 
-def transcribe_audio(audio_bytes, mime_type):
-    """Voice message -> text. Tries Groq Whisper first, then Gemini."""
+# Languages the store supports. Whisper reports the detected language by name.
+_ALLOWED_STT_LANGS = {"english", "urdu", "pashto", "pushto"}
+
+
+def _groq_transcribe(audio_bytes, ext, language=None):
+    kwargs = {
+        "file": (f"audio.{ext}", audio_bytes),
+        "model": GROQ_STT_MODEL,
+        "response_format": "verbose_json",
+        "temperature": 0,
+    }
+    if language:
+        kwargs["language"] = language
+    result = groq_client.audio.transcriptions.create(**kwargs)
+    text = (getattr(result, "text", "") or "").strip()
+    detected = (getattr(result, "language", "") or "").lower()
+    return text, detected
+
+
+def transcribe_audio(audio_bytes, mime_type, language=None):
+    """Voice message -> text. Tries Groq Whisper first, then Gemini.
+    language: optional hint 'en', 'ur' or 'ps'. If Whisper auto-detects a
+    language the store does not support (e.g. Tamil), it is run again with
+    Pashto (or Urdu if it guessed Hindi) forced."""
     base_mime = (mime_type or "audio/webm").split(";")[0]
     ext = base_mime.split("/")[-1] or "webm"
     errors = []
 
     if groq_client:
         try:
-            result = groq_client.audio.transcriptions.create(
-                file=(f"audio.{ext}", audio_bytes), model=GROQ_STT_MODEL,
-            )
-            return result.text.strip()
+            if language:
+                text, _ = _groq_transcribe(audio_bytes, ext, language)
+                return text
+            text, detected = _groq_transcribe(audio_bytes, ext)
+            logger.info(f"Whisper detected language: {detected!r}")
+            if not text or detected in _ALLOWED_STT_LANGS:
+                return text
+            retry_lang = "ur" if detected == "hindi" else "ps"
+            logger.info(f"Unsupported language {detected!r}, retrying as {retry_lang}")
+            text2, _ = _groq_transcribe(audio_bytes, ext, retry_lang)
+            return text2 or text
         except Exception as e:
             logger.warning(f"Groq transcription failed, trying Gemini: {e}")
             errors.append(f"groq: {e}")
@@ -318,7 +347,10 @@ def transcribe_audio(audio_bytes, mime_type):
                 model=GEMINI_MODEL,
                 contents=[
                     types.Part.from_bytes(data=audio_bytes, mime_type=base_mime),
-                    "Transcribe this audio to text. Reply with ONLY the transcribed text, nothing else.",
+                    "Transcribe this audio exactly as spoken. The speaker uses English, Urdu "
+                    "or Pashto. Write Urdu and Pashto in Arabic script, in the same language "
+                    "spoken. Never translate and never use any other language or script. "
+                    "Reply with ONLY the transcribed text, nothing else.",
                 ],
             )
             return (r.text or "").strip()

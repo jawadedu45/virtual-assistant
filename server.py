@@ -123,6 +123,22 @@ def clean_reply(text: str) -> str:
     return text.strip()
 
 
+def is_supported_script(text: str) -> bool:
+    """True only if every letter is Latin (English) or Arabic-script
+    (Urdu/Pashto). Used to reject speech-to-text results that came back
+    in a wrong language such as Tamil."""
+    for ch in text:
+        if ch.isalpha():
+            o = ord(ch)
+            if not (o < 0x250
+                    or 0x0600 <= o <= 0x06FF
+                    or 0x0750 <= o <= 0x077F
+                    or 0xFB50 <= o <= 0xFDFF
+                    or 0xFE70 <= o <= 0xFEFF):
+                return False
+    return True
+
+
 def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
     biz = db.get_business_settings() if DB_AVAILABLE else None
 
@@ -145,7 +161,10 @@ def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
 
         f"LANGUAGE: You support {languages_list}. Detect the language the customer writes in "
         f"and reply naturally in that same language — like a fluent native speaker having a "
-        f"real conversation, never a stiff or literal translation. Match their tone.\n\n"
+        f"real conversation, never a stiff or literal translation. Match their tone. "
+        f"Only ever reply in English, Urdu or Pashto. Never reply in Tamil, Hindi or any other "
+        f"language. If a message looks like another language, ask politely in English or Urdu "
+        f"to repeat it.\n\n"
 
         f"YOUR JOB: You are not a search engine — you are a skilled, experienced salesperson. "
         f"Understand what the customer actually wants, ask smart follow-up questions when "
@@ -1005,6 +1024,12 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
         return {"transcript": "", "reply": "Sorry, I couldn't process that voice message."}
+
+    # Reject empty transcripts and ones written in a wrong script (e.g. Tamil),
+    # which happens when speech-to-text guesses the wrong language.
+    if not transcript or not transcript.strip() or not is_supported_script(transcript):
+        logger.warning(f"Rejected transcript (empty or unsupported script): {transcript!r}")
+        return {"transcript": "", "reply": "Sorry, I couldn't hear that clearly. Please try again or type your message."}
 
     if DB_AVAILABLE:
         try:
