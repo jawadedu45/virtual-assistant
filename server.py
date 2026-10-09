@@ -274,7 +274,7 @@ def search_products_tool(keyword: str = None, category: str = None,
     or wants to see product images/videos. Returns a JSON list of matching
     products (name, price, discount_price if any, currency, color, size,
     stock, brand, description, whether images/video are available) —
-    at most 5 results."""
+    up to 30 results (items with stock 0 are out of stock)."""
     if not DB_AVAILABLE:
         return json.dumps([])
     try:
@@ -834,7 +834,7 @@ TOOL_SCHEMAS = [
           {"city": {"type": "string"}}, ["city"]),
     _tool("search_products_tool",
           "Searches the store's product catalog. Use whenever a customer asks about items, prices, "
-          "colors, categories, availability or discounts. Returns at most 5 products.",
+          "colors, categories, availability or discounts. Returns up to 30 products; stock 0 means out of stock.",
           {"keyword": {"type": "string", "description": "e.g. waistcoat, cap, kids suit"},
            "category": {"type": "string"},
            "max_price": {"type": "number"},
@@ -868,6 +868,17 @@ TOOL_SCHEMAS = [
 ]
 
 
+def detect_language(text: str):
+    """Returns 'Pashto' or 'Urdu' when the message has letters unique to them, else None."""
+    pashto_letters = set("ټډړڼښږځڅۍې")
+    urdu_letters = set("ٹڈڑںےھہۓ")
+    if any(ch in pashto_letters for ch in text):
+        return "Pashto"
+    if any(ch in urdu_letters for ch in text):
+        return "Urdu"
+    return None
+
+
 def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
     # If a manager has taken this conversation over, the AI stays
     # completely silent — no auto-replies until it's handed back.
@@ -879,6 +890,14 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
     full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
+
+    lang = detect_language(message)
+    if lang:
+        full_system_prompt += (
+            f"\n\nIMPORTANT: The customer's latest message is written in {lang}. "
+            f"Write your whole reply in {lang}, in Arabic script. Product names stay "
+            f"exactly as they appear in the catalog."
+        )
 
     create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
     log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous", conversation_id)
