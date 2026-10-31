@@ -249,10 +249,17 @@ def fmt_price(value) -> str:
         return str(value)
 
 
+_catalog_cache = {"ts": 0, "items": []}
+CATALOG_CACHE_SECONDS = 60  # product edits in the admin panel show up within a minute
+
+
 def catalog_products() -> list:
-    """Real products and prices from YOUR DATABASE (not shops.json)."""
+    """Real products and prices from YOUR DATABASE (not shops.json).
+    Remembered for 60 seconds so it doesn't hit the database on every message."""
     if not DB_AVAILABLE:
         return []
+    if time.time() - _catalog_cache["ts"] < CATALOG_CACHE_SECONDS and _catalog_cache["items"]:
+        return _catalog_cache["items"]
     try:
         items = []
         for p in db.list_products():
@@ -260,10 +267,12 @@ def catalog_products() -> list:
             price = p.get("discount_price") or p.get("price")
             if name and price:
                 items.append({"name": name, "price": float(price), "keywords": p.get("keywords") or ""})
+        _catalog_cache["items"] = items
+        _catalog_cache["ts"] = time.time()
         return items
     except Exception as e:
         logger.error(f"Catalog lookup failed: {e}")
-        return []
+        return _catalog_cache["items"]
 
 
 def message_names_product(text: str) -> bool:
@@ -352,6 +361,7 @@ def fast_reply(shop: dict, history: list) -> str:
     recent = history[-4:]  # a little context, still very fast
 
     # --- Groq (main) ---
+    t0 = time.perf_counter()
     try:
         if not llm.groq_client:
             raise RuntimeError("Groq client not available")
@@ -366,11 +376,13 @@ def fast_reply(shop: dict, history: list) -> str:
         text = (resp.choices[0].message.content or "").strip()
         if not text:
             raise RuntimeError("Groq returned empty text")
+        logger.info(f"TIMING fast groq {FAST_MODEL_GROQ}: {time.perf_counter() - t0:.2f}s")
         return text
     except Exception as groq_err:
         logger.warning(f"Groq fast reply failed, trying Gemini: {groq_err}")
 
     # --- Gemini (backup, only reached if Groq failed) ---
+    t1 = time.perf_counter()
     if not llm.gemini_client:
         raise RuntimeError("Gemini client not available")
     contents = [
@@ -388,6 +400,7 @@ def fast_reply(shop: dict, history: list) -> str:
     text = (resp.text or "").strip()
     if not text:
         raise RuntimeError("Gemini returned empty text")
+    logger.info(f"TIMING fast gemini {FAST_MODEL_GEMINI}: {time.perf_counter() - t1:.2f}s")
     return text
 
 
@@ -1232,8 +1245,10 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
                     make_lead_scoring_tool(user_id, conversation_id)("asked_price")
                 except Exception as e:
                     logger.error(f"Lead score on cached price failed: {e}")
+            logger.info("PATH cache (no AI call)")
             return cached
 
+        logger.info("PATH fast (Groq, then Gemini only if Groq fails)")
         history = build_recent_history(conversation_id) if conversation_id else []
         if not history or history[-1]["role"] != "user":
             history.append({"role": "user", "content": message})
@@ -1246,6 +1261,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     # ---------------------------------------------------------------
     # FULL AGENT (orders, handoff, complaints) - your original logic
     # ---------------------------------------------------------------
+    logger.info("PATH full agent (order / human / complaint)")
     mark_order_mode(conversation_id)
 
     relevant_chunk = search_document(message)
@@ -1406,6 +1422,7 @@ def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str
 
     user_id = request.user_id or "anonymous"
     conversation_id = None
+    t_start = time.perf_counter()
 
     if DB_AVAILABLE:
         try:
@@ -1417,10 +1434,13 @@ def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str
         except Exception as e:
             logger.error(f"Could not persist incoming message: {e}")
             conversation_id = None
+    t_db = time.perf_counter()
 
     try:
         reply = generate_reply(request.message, user_id=user_id,
                                conversation_id=conversation_id, shop=shop_data)
+        t_reply = time.perf_counter()
+        logger.info(f"TIMING /chat database_before={t_db - t_start:.2f}s reply={t_reply - t_db:.2f}s")
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
@@ -1438,7 +1458,9 @@ def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str
 
     result = {"reply": reply, "conversation_id": conversation_id}
 
+    t_after = time.perf_counter()
     image_urls = find_reply_images(reply, request.message)
+    logger.info(f"TIMING /chat save+memory={t_after - t_reply:.2f}s images={time.perf_counter() - t_after:.2f}s")
     if image_urls:
         result["image_urls"] = image_urls
         result["image_url"] = image_urls[0]  # kept for older widget versions
