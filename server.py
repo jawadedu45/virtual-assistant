@@ -241,6 +241,60 @@ CACHE_KEYWORDS = {
 CACHE_MAX_WORDS = 8  # only short messages use the cache; longer ones go to the AI
 
 
+def fmt_price(value) -> str:
+    try:
+        v = float(value)
+        return str(int(v)) if v.is_integer() else str(v)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def catalog_products() -> list:
+    """Real products and prices from YOUR DATABASE (not shops.json)."""
+    if not DB_AVAILABLE:
+        return []
+    try:
+        items = []
+        for p in db.list_products():
+            name = (p.get("product_name") or "").strip()
+            price = p.get("discount_price") or p.get("price")
+            if name and price:
+                items.append({"name": name, "price": float(price), "keywords": p.get("keywords") or ""})
+        return items
+    except Exception as e:
+        logger.error(f"Catalog lookup failed: {e}")
+        return []
+
+
+def message_names_product(text: str) -> bool:
+    """True if the customer mentions a specific product (by name or keyword)."""
+    lower = text.lower()
+    for p in catalog_products():
+        if p["name"].lower() in lower:
+            return True
+        for kw in p["keywords"].split(","):
+            kw = kw.strip().lower()
+            if kw and kw in lower:
+                return True
+    return False
+
+
+def catalog_price_reply(lang: str):
+    """Instant price answer built from the database: price range plus a few
+    real products. Product names in the reply make their pictures appear."""
+    items = sorted(catalog_products(), key=lambda p: p["price"])
+    if not items:
+        return None
+    lo, hi = fmt_price(items[0]["price"]), fmt_price(items[-1]["price"])
+    step = max(1, len(items) // 5)
+    sample = ", ".join(f"{p['name']} {fmt_price(p['price'])}" for p in items[::step][:5])
+    if lang == "ps":
+        return f"زموږ بیې له {lo} نه تر {hi} روپۍ پورې دي. {sample}"
+    if lang == "ur":
+        return f"ہماری قیمتیں {lo} سے {hi} روپے تک ہیں۔ {sample}"
+    return f"Our prices range from {lo} to {hi} PKR. {sample}"
+
+
 def get_cached_reply(shop: dict, text: str, lang: str):
     """Returns (topic, reply) or (None, None)."""
     lower = text.lower().strip()
@@ -251,6 +305,14 @@ def get_cached_reply(shop: dict, text: str, lang: str):
             # English words match as whole words ("rate" must not match "separate")
             hit = re.search(rf"\b{re.escape(w)}\b", lower) if w.isascii() else (w in lower)
             if hit:
+                # A question about one specific product ("price of black waistcoat")
+                # must be answered by the AI from the real database, not the cache.
+                if topic in ("price", "size") and message_names_product(text):
+                    return None, None
+                if topic == "price":
+                    live = catalog_price_reply(lang)  # real prices from the database
+                    if live:
+                        return topic, live
                 entry = (shop.get("faq") or {}).get(topic)
                 if entry:
                     return topic, entry.get(lang) or entry.get("en")
@@ -269,9 +331,17 @@ FAST_MAX_TOKENS_GEMINI = int(os.getenv("FAST_MAX_TOKENS_GEMINI", "1024"))
 
 
 def build_fast_prompt(shop: dict) -> str:
+    # Products and prices come from the DATABASE; shops.json is only the fallback.
+    items = catalog_products()
+    if items:
+        products = ", ".join(f"{p['name']} {fmt_price(p['price'])}" for p in items[:25])
+        price_range = f"{fmt_price(min(p['price'] for p in items))}-{fmt_price(max(p['price'] for p in items))}"
+    else:
+        products = ", ".join(shop.get("products", []))
+        price_range = shop.get("price_range", "2500-5500")
     return (
-        f"You are salesman for {shop.get('name')}. Products: {', '.join(shop.get('products', []))}. "
-        f"Prices {shop.get('price_range', '2500-5500')} PKR. Reply in same language as user "
+        f"You are salesman for {shop.get('name')}. Products: {products}. "
+        f"Prices {price_range} PKR. Reply in same language as user "
         f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI."
     )
 
