@@ -1,0 +1,40 @@
+{
+  "bangash": {
+    "name": "Bangash Fabrics",
+    "owner_whatsapp": "923001234567",
+    "owner_email": "owner@example.com",
+    "price_range": "2500-5500",
+    "address": "Karkhano Market, Peshawar",
+    "products": ["Black Waistcoat 3500", "Navy 4000"],
+    "faq": {
+      "price": {
+        "en": "Our waistcoat fabrics range from 2500 to 5500 PKR. Black 3500, Navy 4000.",
+        "ur": "ہمارے ویسٹ کوٹ کپڑے 2500 سے 5500 روپے تک ہیں۔ بلیک 3500، نیوی 4000۔",
+        "ps": "زموږ د ویسکټ ټوکر بیې له ۲۵۰۰ نه تر ۵۵۰۰ روپۍ پورې دي. تور ۳۵۰۰، نیوي ۴۰۰۰."
+      },
+      "location": {
+        "en": "We are in Karkhano Market, Peshawar. Welcome!",
+        "ur": "ہم کارخانو مارکیٹ، پشاور میں ہیں۔ تشریف لائیں!",
+        "ps": "موږ د کارخانو مارکیټ، پېښور کې یو. راشئ!"
+      },
+      "size": {
+        "en": "Fabric is cut to your required length. Tell me your size and I will confirm.",
+        "ur": "کپڑا آپ کی ضرورت کے مطابق کاٹا جاتا ہے۔ اپنا سائز بتائیں۔",
+        "ps": "ټوکر ستاسو د اړتیا مطابق پرې کېږي. خپل سایز راته ووایاست."
+      }
+    }
+  },
+  "shop2": {
+    "name": "Second Shop Name",
+    "owner_whatsapp": "923009999999",
+    "owner_email": "owner2@example.com",
+    "price_range": "2000-6000",
+    "address": "Your address here",
+    "products": ["Grey Waistcoat 3000", "Brown 3800"],
+    "faq": {
+      "price": { "en": "Prices 2000 to 6000 PKR.", "ur": "قیمت 2000 سے 6000 روپے۔", "ps": "بیې ۲۰۰۰ نه تر ۶۰۰۰ روپۍ." },
+      "location": { "en": "Visit us at our shop.", "ur": "ہماری دکان پر تشریف لائیں۔", "ps": "زموږ دوکان ته راشئ." },
+      "size": { "en": "Tell me your size.", "ur": "اپنا سائز بتائیں۔", "ps": "خپل سایز ووایاست." }
+    }
+  }
+}

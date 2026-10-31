@@ -10,6 +10,10 @@ let mediaRecorder;
 let audioChunks = [];
 let isRecording = false;
 
+// NEW: which shop this page is for, read from the URL, e.g.  /?shop=bangash
+// If there is no ?shop= the server uses its default shop.
+const SHOP = new URLSearchParams(window.location.search).get('shop') || '';
+
 function getOrCreateId(key) {
   let id = localStorage.getItem(key);
   if (!id) {
@@ -19,12 +23,15 @@ function getOrCreateId(key) {
   return id;
 }
 const USER_ID = getOrCreateId('khyber_user_id');
-let conversationId = localStorage.getItem('khyber_conversation_id') || null;
+
+// NEW: each shop keeps its own conversation, so chats never mix between shops.
+const CONV_KEY = 'khyber_conversation_id' + (SHOP ? ':' + SHOP : '');
+let conversationId = localStorage.getItem(CONV_KEY) || null;
 
 function setConversationId(id) {
   if (id && id !== conversationId) {
     conversationId = id;
-    localStorage.setItem('khyber_conversation_id', id);
+    localStorage.setItem(CONV_KEY, id);
   }
 }
 
@@ -50,7 +57,7 @@ function addVideoBubble(videoUrl) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-// NEW: renders a product picture in the chat, same treatment as video.
+// Renders a product picture in the chat, same treatment as video.
 function addImageBubble(imageUrl) {
   const bubble = document.createElement('div');
   bubble.className = 'bubble bot';
@@ -153,7 +160,13 @@ async function sendMessage() {
         'Content-Type': 'application/json',
         'X-API-Key': API_KEY
       },
-      body: JSON.stringify({ message: text, user_id: USER_ID, conversation_id: conversationId })
+      // NEW: shop is sent with every message (empty = server default shop)
+      body: JSON.stringify({
+        message: text,
+        user_id: USER_ID,
+        conversation_id: conversationId,
+        shop: SHOP || undefined
+      })
     });
     const data = await response.json();
     hideTyping();
@@ -164,7 +177,7 @@ async function sendMessage() {
       // e.g. via the admin panel or another channel).
       return;
     }
-    addBubble(data.reply, 'bot');
+    addBubble(data.reply || data.detail || "Sorry, something went wrong.", 'bot');
     showImages(data);
     if (data.video_url) {
       addVideoBubble(data.video_url);
@@ -210,6 +223,41 @@ micBtn.addEventListener('click', async () => {
   }
 });
 
+// NEW: plays a base64 audio clip. mimeType is audio/mpeg (Edge-TTS)
+// or audio/wav (Gemini backup voice).
+function playBase64Audio(base64, mimeType) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: mimeType || 'audio/mpeg' });
+  const audio = new Audio(URL.createObjectURL(blob));
+  // Some browsers block autoplay; ignore that error quietly.
+  audio.play().catch((err) => console.warn('Audio play blocked:', err));
+}
+
+// NEW: the voice reply is built by the server AFTER the text is sent.
+// Ask for it every 0.5 seconds (up to ~15 seconds) and play it when ready.
+async function fetchAndPlayVoice(voiceId) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try {
+      const response = await fetch(`/voice-audio/${encodeURIComponent(voiceId)}`, {
+        headers: { 'X-API-Key': API_KEY }
+      });
+      const job = await response.json();
+      if (job.status === 'ready' && job.audio_base64) {
+        playBase64Audio(job.audio_base64, job.mime_type);
+        return;
+      }
+      if (job.status === 'failed') return; // text reply is already shown
+    } catch (error) {
+      console.warn('Voice check failed:', error);
+    }
+  }
+}
+
 async function sendVoiceMessage(audioBlob) {
   showTyping();
   const reader = new FileReader();
@@ -223,27 +271,32 @@ async function sendVoiceMessage(audioBlob) {
           'Content-Type': 'application/json',
           'X-API-Key': API_KEY
         },
-        body: JSON.stringify({ audio_base64: base64Audio, mime_type: 'audio/webm', user_id: USER_ID, conversation_id: conversationId })
+        body: JSON.stringify({
+          audio_base64: base64Audio,
+          mime_type: 'audio/webm',
+          user_id: USER_ID,
+          conversation_id: conversationId,
+          shop: SHOP || undefined
+        })
       });
       const data = await response.json();
       hideTyping();
       setConversationId(data.conversation_id);
       if (data.transcript) addBubble(data.transcript, 'user');
-      addBubble(data.reply, 'bot');
+      if (data.handed_off) return;
+
+      // 1) TEXT first, immediately
+      addBubble(data.reply || data.detail || "Sorry, something went wrong.", 'bot');
       showImages(data);
       if (data.video_url) {
         addVideoBubble(data.video_url);
       }
-      if (data.reply_audio) {
-        const binary = atob(data.reply_audio);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        const blob = new Blob([bytes], { type: 'audio/wav' });
-        const audioUrl = URL.createObjectURL(blob);
-        const audio = new Audio(audioUrl);
-        audio.play();
+
+      // 2) VOICE a moment later
+      if (data.voice_id) {
+        fetchAndPlayVoice(data.voice_id); // not awaited, so nothing is blocked
+      } else if (data.reply_audio) {
+        playBase64Audio(data.reply_audio, 'audio/wav'); // old server format
       }
 
     } catch (error) {

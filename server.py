@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -11,6 +11,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from email.mime.text import MIMEText
 import urllib.request
+import urllib.error
 import smtplib
 import os
 import re
@@ -21,6 +22,8 @@ import wave
 import io
 import time
 import random
+import asyncio
+import threading
 
 import db
 import llm  # all AI calls (Groq first, Gemini as backup) live in llm.py
@@ -73,20 +76,85 @@ PERSONALITY_STYLES = {
 
 
 # =======================================================================
-# MANAGER EMAIL ALERTS
+# NEW (TASK 4): MULTI-SHOP LOADER
 # =======================================================================
-# Sends a real email to the manager, in addition to the dashboard
-# notification. Needs these environment variables (Vercel + local .env):
+# shops.json holds one entry per shop. The shop is chosen by the URL
+# parameter ?shop=bangash (or a "shop" field in the request body).
+# Edits to shops.json are picked up automatically, no restart needed.
+SHOPS_FILE = "shops.json"
+_shops_cache = {"mtime": 0, "data": {}}
+
+
+def load_shops() -> dict:
+    try:
+        mtime = os.path.getmtime(SHOPS_FILE)
+        if mtime != _shops_cache["mtime"]:
+            with open(SHOPS_FILE, "r", encoding="utf-8") as f:
+                _shops_cache["data"] = json.load(f)
+            _shops_cache["mtime"] = mtime
+    except Exception as e:
+        logger.error(f"Could not load shops.json: {e}")
+    return _shops_cache["data"]
+
+
+def resolve_shop(shop_key: Optional[str]):
+    """Returns (key, shop_dict). Falls back to DEFAULT_SHOP when no ?shop= is given."""
+    key = (shop_key or os.getenv("DEFAULT_SHOP", "bangash")).strip().lower()
+    shop = load_shops().get(key)
+    if not shop:
+        raise HTTPException(status_code=404, detail="Unknown shop")
+    return key, shop
+
+
+# =======================================================================
+# NEW (TASK 1): OWNER ALERTS - WhatsApp first, email as backup
+# =======================================================================
+# Needs in .env:  WA_PHONE_NUMBER_ID, WA_ACCESS_TOKEN
+# Each shop's owner number comes from shops.json -> "owner_whatsapp".
+def send_whatsapp(to_number: str, text: str):
+    """Sends a WhatsApp text through Meta's Cloud API.
+    Raises an error if anything fails, so the caller can fall back to email."""
+    phone_number_id = os.getenv("WA_PHONE_NUMBER_ID")
+    access_token = os.getenv("WA_ACCESS_TOKEN")
+    if not all([phone_number_id, access_token, to_number]):
+        raise RuntimeError("WhatsApp not configured")
+
+    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+    payload = json.dumps({
+        "messaging_product": "whatsapp",
+        "to": re.sub(r"\D", "", to_number),  # digits only, e.g. 923001234567
+        "type": "text",
+        "text": {"body": text},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"WhatsApp {e.code}: {e.read().decode('utf-8', 'ignore')}")
+
+
+# =======================================================================
+# MANAGER EMAIL ALERTS (now used only as the BACKUP if WhatsApp fails)
+# =======================================================================
+# Needs these environment variables (Vercel + local .env):
 #   MANAGER_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
 # If any are missing it only logs a warning; the chatbot keeps working.
-def send_manager_email(subject: str, body: str):
+def send_manager_email(subject: str, body: str, to: Optional[str] = None):
     try:
         biz = db.get_business_settings() if DB_AVAILABLE else None
         # Skip only if the owner switched notifications off.
         if biz is not None and biz.get("notifications_enabled") == 0:
             return
 
-        manager_email = os.getenv("MANAGER_EMAIL")
+        manager_email = to or os.getenv("MANAGER_EMAIL")
         smtp_host = os.getenv("SMTP_HOST")
         smtp_port = int(os.getenv("SMTP_PORT", "587"))
         smtp_user = os.getenv("SMTP_USER")
@@ -111,6 +179,177 @@ def send_manager_email(subject: str, body: str):
         logger.info(f"Manager email sent: {subject}")
     except Exception as e:
         logger.error(f"Manager email failed: {e}")
+
+
+def notify_owner(shop: dict, subject: str, body: str):
+    """Alerts the shop owner: WhatsApp first, email if WhatsApp fails.
+    Runs in a background thread so the customer's reply is never slowed down."""
+    def _run():
+        try:
+            biz = db.get_business_settings() if DB_AVAILABLE else None
+            if biz is not None and biz.get("notifications_enabled") == 0:
+                return
+            try:
+                send_whatsapp(shop.get("owner_whatsapp"), f"{subject}\n{body}")
+                logger.info(f"Owner alerted on WhatsApp: {subject}")
+                return
+            except Exception as wa_err:
+                logger.warning(f"WhatsApp failed, using email backup: {wa_err}")
+            send_manager_email(subject, body, to=shop.get("owner_email"))
+        except Exception as e:
+            logger.error(f"Owner alert failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def lang_code(text: str) -> str:
+    """'ps' (Pashto), 'ur' (Urdu) or 'en' (English)."""
+    found = detect_language(text)
+    if found == "Pashto":
+        return "ps"
+    if found == "Urdu":
+        return "ur"
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "ur"  # Arabic script with no Pashto-only letters
+    return "en"
+
+
+def alert_new_customer(shop: dict, user_id: str, query: str):
+    """Sends the 'New Customer' WhatsApp alert (first message of a conversation)."""
+    customer = (db.get_customer(user_id) if DB_AVAILABLE else None) or {}
+    lang_label = {"en": "English", "ur": "Urdu", "ps": "Pashto"}[lang_code(query)]
+    body = (
+        f"Shop: {shop.get('name')}\n"
+        f"Name: {customer.get('name') or 'Unknown'}\n"
+        f"Query: {query}\n"
+        f"Lang: {lang_label}\n"
+        f"Customer Phone: {customer.get('phone') or 'Not given'}"
+    )
+    notify_owner(shop, "New Customer 🔥", body)
+
+
+# =======================================================================
+# NEW (TASK 2): INSTANT CACHE + FAST LLM PATH
+# =======================================================================
+# Short messages about price / location / size are answered straight from
+# shops.json -> "faq" with NO LLM call at all.
+CACHE_KEYWORDS = {
+    "price": ["price", "rate", "how much", "قیمت", "ریٹ", "بیه", "بیې", "کتنے کا"],
+    "location": ["location", "address", "where", "لوکیشن", "پتہ", "پته", "ایڈریس", "کہاں", "چیرته"],
+    "size": ["size", "سائز", "سایز", "ناپ"],
+}
+CACHE_MAX_WORDS = 8  # only short messages use the cache; longer ones go to the AI
+
+
+def get_cached_reply(shop: dict, text: str, lang: str):
+    """Returns (topic, reply) or (None, None)."""
+    lower = text.lower().strip()
+    if len(lower.split()) > CACHE_MAX_WORDS:
+        return None, None
+    for topic, words in CACHE_KEYWORDS.items():
+        for w in words:
+            # English words match as whole words ("rate" must not match "separate")
+            hit = re.search(rf"\b{re.escape(w)}\b", lower) if w.isascii() else (w in lower)
+            if hit:
+                entry = (shop.get("faq") or {}).get(topic)
+                if entry:
+                    return topic, entry.get(lang) or entry.get("en")
+    return None, None
+
+
+# llama-3.1-8b-instant was shut down by Groq on 16 Aug 2026. Its official
+# replacement is openai/gpt-oss-20b, which llm.py already uses as GROQ_FAST_MODEL.
+FAST_MODEL_GROQ = llm.GROQ_FAST_MODEL
+FAST_MODEL_GEMINI = llm.GEMINI_MODEL
+# GPT-OSS and Gemini 3.x "think" before answering, and the thinking uses up
+# tokens. With max_tokens=60 the visible answer comes back EMPTY, so the limit
+# is higher; the prompt ("under 20 words") is what keeps replies short.
+FAST_MAX_TOKENS = int(os.getenv("FAST_MAX_TOKENS", "300"))
+FAST_MAX_TOKENS_GEMINI = int(os.getenv("FAST_MAX_TOKENS_GEMINI", "1024"))
+
+
+def build_fast_prompt(shop: dict) -> str:
+    return (
+        f"You are salesman for {shop.get('name')}. Products: {', '.join(shop.get('products', []))}. "
+        f"Prices {shop.get('price_range', '2500-5500')} PKR. Reply in same language as user "
+        f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI."
+    )
+
+
+def fast_reply(shop: dict, history: list) -> str:
+    """Short, quick answer. Groq 8b-instant first; Gemini ONLY if Groq fails."""
+    system = build_fast_prompt(shop)
+    recent = history[-4:]  # a little context, still very fast
+
+    # --- Groq (main) ---
+    try:
+        if not llm.groq_client:
+            raise RuntimeError("Groq client not available")
+        resp = llm.groq_client.chat.completions.create(
+            model=FAST_MODEL_GROQ,
+            messages=[{"role": "system", "content": system}] + recent,
+            max_tokens=FAST_MAX_TOKENS,
+            temperature=0.7,
+            timeout=8,
+            extra_body={"reasoning_effort": "low"},  # less thinking = faster
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            raise RuntimeError("Groq returned empty text")
+        return text
+    except Exception as groq_err:
+        logger.warning(f"Groq fast reply failed, trying Gemini: {groq_err}")
+
+    # --- Gemini (backup, only reached if Groq failed) ---
+    if not llm.gemini_client:
+        raise RuntimeError("Gemini client not available")
+    contents = [
+        types.Content(role="user" if m["role"] == "user" else "model",
+                      parts=[types.Part(text=m["content"])])
+        for m in recent
+    ]
+    resp = llm.gemini_client.models.generate_content(
+        model=FAST_MODEL_GEMINI,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system, max_output_tokens=FAST_MAX_TOKENS_GEMINI, temperature=0.7
+        ),
+    )
+    text = (resp.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty text")
+    return text
+
+
+# Normal chat uses the fast path above. Ordering, human-handoff and
+# complaints still need the full tool-using agent, so these words send the
+# message to the full agent, and it stays in "order mode" for 15 minutes so
+# follow-up answers (name, phone, "yes") are handled by the same agent.
+AGENT_WORDS = [
+    "order", "buy", "purchase", "confirm", "deliver", "my name", "phone", "number",
+    "human", "real person", "manager", "owner", "call me", "complaint", "refund",
+    "discount", "cash on delivery", "cod",
+    "آرڈر", "خرید", "منگوا", "ڈیلیور", "ایڈریس", "رابطہ", "بات کر", "شکایت",
+    "ڈسکاؤنٹ", "کنفرم", "آرډر", "اخیست", "پیرود", "تایید",
+]
+ORDER_MODE = {}  # conversation_id -> expiry timestamp
+ORDER_MODE_SECONDS = 15 * 60
+
+
+def needs_full_agent(message: str) -> bool:
+    lower = message.lower()
+    if any(w in lower for w in AGENT_WORDS):
+        return True
+    return len(re.sub(r"\D", "", message)) >= 10  # looks like a phone number
+
+
+def in_order_mode(conversation_id: Optional[str]) -> bool:
+    return bool(conversation_id) and ORDER_MODE.get(conversation_id, 0) > time.time()
+
+
+def mark_order_mode(conversation_id: Optional[str]):
+    if conversation_id:
+        ORDER_MODE[conversation_id] = time.time() + ORDER_MODE_SECONDS
 
 
 def clean_reply(text: str) -> str:
@@ -139,11 +378,11 @@ def is_supported_script(text: str) -> bool:
     return True
 
 
-def build_system_prompt(relevant_chunk: str, memory_context: str) -> str:
+def build_system_prompt(relevant_chunk: str, memory_context: str, shop_name: Optional[str] = None) -> str:
     biz = db.get_business_settings() if DB_AVAILABLE else None
 
     ai_name = (biz and biz.get("ai_name")) or ASSISTANT_NAME
-    business_name = (biz and biz.get("name")) or ASSISTANT_NAME
+    business_name = shop_name or (biz and biz.get("name")) or ASSISTANT_NAME
     personality_key = (biz and biz.get("personality")) or "friendly"
     personality_desc = PERSONALITY_STYLES.get(personality_key, PERSONALITY_STYLES["friendly"])
     custom_instructions = (biz and biz.get("custom_instructions")) or ""
@@ -490,6 +729,7 @@ class ChatRequest(BaseModel):
     message: str
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
+    shop: Optional[str] = None  # NEW: which shop (also accepted as ?shop= in the URL)
 
 
 class VoiceRequest(BaseModel):
@@ -497,6 +737,7 @@ class VoiceRequest(BaseModel):
     mime_type: str = "audio/webm"
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
+    shop: Optional[str] = None  # NEW
 
 
 class ProductIn(BaseModel):
@@ -580,6 +821,14 @@ def read_root():
     }
 
 
+# NEW (TASK 2): point UptimeRobot (free) at  https://YOUR-APP-URL/health
+# with a 5-minute interval. Free hosts sleep after ~15 minutes without
+# traffic; this ping keeps the server awake.
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/settings")
 def get_settings():
     biz = db.get_business_settings() if DB_AVAILABLE else None
@@ -658,13 +907,13 @@ def _notify_if_became_hot(user_id: str, conversation_id: str, old_status: str, n
                 title="NEW HOT CUSTOMER LEAD 🔥",
                 message=f"{customer.get('name') or 'A customer'} (score: {new_score}) is showing strong buying signals. Recommended action: reach out or keep an eye on this conversation.",
             )
-            # Email is intentionally NOT sent for hot-lead pings (could spam
-            # the manager). They show instantly on the dashboard instead.
+            # Email/WhatsApp is intentionally NOT sent for hot-lead pings (could spam
+            # the owner). They show instantly on the dashboard instead.
         except Exception as e:
             logger.error(f"Could not create hot-lead notification: {e}")
 
 
-def make_order_tools(user_id: str, conversation_id: str):
+def make_order_tools(user_id: str, conversation_id: str, shop: dict):
     def create_order_tool(product_id: str, color: str = None, size: str = None,
                            quantity: int = 1, customer_name: str = None,
                            customer_phone: str = None, delivery_address: str = None,
@@ -756,12 +1005,14 @@ def make_order_tools(user_id: str, conversation_id: str):
                 product_id=order.get("product_id") if order else None,
             )
 
-            # Real email alert to the manager (not just a dashboard row)
+            # NEW: WhatsApp alert to the shop owner (email is the backup)
             phone = (order.get("customer_phone") if order else None) or customer.get("phone") or "-"
             address = (order.get("delivery_address") if order else None) or "-"
-            send_manager_email(
-                subject=f"New order confirmed - {product_name}",
-                body=(
+            notify_owner(
+                shop,
+                f"Order confirmed - {product_name}",
+                (
+                    f"Shop: {shop.get('name')}\n"
                     f"{customer_label} just confirmed an order.\n\n"
                     f"Product: {product_name}\n"
                     f"Size: {(order.get('size') if order else None) or '-'}\n"
@@ -786,7 +1037,7 @@ def make_order_tools(user_id: str, conversation_id: str):
     return create_order_tool, confirm_order_tool
 
 
-def make_human_handoff_tool(user_id: str, conversation_id: str):
+def make_human_handoff_tool(user_id: str, conversation_id: str, shop: dict):
     def request_human_tool(reason: str) -> str:
         """Call this when the customer explicitly asks to speak with a real
         person, requests a phone call, has a complaint, asks for a discount
@@ -803,11 +1054,13 @@ def make_human_handoff_tool(user_id: str, conversation_id: str):
                     title="⚠️ HUMAN HELP REQUIRED",
                     message=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}",
                 )
-                # Human-help requests are time-sensitive: email the manager too.
-                send_manager_email(
-                    subject="Customer needs human help",
-                    body=f"{customer.get('name') or 'A customer'} needs human assistance: {reason}\n\n"
-                         f"Open the admin dashboard's Conversations tab and click 'Take Over' to reply directly.",
+                # Human-help requests are time-sensitive: alert the owner (WhatsApp, then email).
+                notify_owner(
+                    shop,
+                    "Customer needs human help",
+                    f"Shop: {shop.get('name')}\n"
+                    f"{customer.get('name') or 'A customer'} needs human assistance: {reason}\n\n"
+                    f"Open the admin dashboard's Conversations tab and click 'Take Over' to reply directly.",
                 )
             except Exception as e:
                 logger.error(f"Could not flag human handoff: {e}")
@@ -879,7 +1132,10 @@ def detect_language(text: str):
     return None
 
 
-def generate_reply(message: str, user_id: str = None, conversation_id: str = None) -> str:
+def generate_reply(message: str, user_id: str = None, conversation_id: str = None,
+                   shop: dict = None) -> str:
+    shop = shop or {}
+
     # If a manager has taken this conversation over, the AI stays
     # completely silent — no auto-replies until it's handed back.
     if DB_AVAILABLE and conversation_id:
@@ -887,21 +1143,56 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         if convo and convo.get("mode") == "human":
             return None
 
+    lang = lang_code(message)
+
+    # ---------------------------------------------------------------
+    # NEW (TASK 2): FAST PATHS for normal chat
+    #   1) instant cache for price / location / size (no LLM at all)
+    #   2) short-prompt Groq 8b-instant (Gemini only if Groq fails)
+    # Ordering / human-help / complaints skip this and use the full
+    # tool-using agent below.
+    # ---------------------------------------------------------------
+    wants_agent = in_order_mode(conversation_id) or needs_full_agent(message)
+
+    if not wants_agent:
+        topic, cached = get_cached_reply(shop, message, lang)
+        if cached:
+            if topic == "price" and user_id and DB_AVAILABLE:
+                try:  # keep the lead-score bonus for price questions
+                    make_lead_scoring_tool(user_id, conversation_id)("asked_price")
+                except Exception as e:
+                    logger.error(f"Lead score on cached price failed: {e}")
+            return cached
+
+        history = build_recent_history(conversation_id) if conversation_id else []
+        if not history or history[-1]["role"] != "user":
+            history.append({"role": "user", "content": message})
+        try:
+            return clean_reply(fast_reply(shop, history))
+        except Exception as e:
+            logger.error(f"Fast reply failed on Groq and Gemini: {e}")
+            return "Please wait, the owner will contact you shortly."
+
+    # ---------------------------------------------------------------
+    # FULL AGENT (orders, handoff, complaints) - your original logic
+    # ---------------------------------------------------------------
+    mark_order_mode(conversation_id)
+
     relevant_chunk = search_document(message)
     memory_context = build_memory_context(user_id) if user_id else ""
-    full_system_prompt = build_system_prompt(relevant_chunk, memory_context)
+    full_system_prompt = build_system_prompt(relevant_chunk, memory_context, shop_name=shop.get("name"))
 
-    lang = detect_language(message)
-    if lang:
+    detected = detect_language(message)
+    if detected:
         full_system_prompt += (
-            f"\n\nIMPORTANT: The customer's latest message is written in {lang}. "
-            f"Write your whole reply in {lang}, in Arabic script. Product names stay "
+            f"\n\nIMPORTANT: The customer's latest message is written in {detected}. "
+            f"Write your whole reply in {detected}, in Arabic script. Product names stay "
             f"exactly as they appear in the catalog."
         )
 
-    create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id)
+    create_order_tool, confirm_order_tool = make_order_tools(user_id or "anonymous", conversation_id, shop)
     log_customer_signal_tool = make_lead_scoring_tool(user_id or "anonymous", conversation_id)
-    request_human_tool = make_human_handoff_tool(user_id or "anonymous", conversation_id)
+    request_human_tool = make_human_handoff_tool(user_id or "anonymous", conversation_id, shop)
     tool_functions = dict(TOOL_FUNCTIONS)
     tool_functions["create_order_tool"] = create_order_tool
     tool_functions["confirm_order_tool"] = confirm_order_tool
@@ -926,9 +1217,43 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
     return clean_reply(reply)
 
 
+# =======================================================================
+# NEW (TASK 3): FAST VOICE
+# Voice -> Groq Whisper -> text -> cache -> Groq LLM -> send TEXT now
+# -> then build the VOICE reply in the background (starts 1 second later).
+# The widget collects the audio from GET /voice-audio/{voice_id}.
+# =======================================================================
+VOICE_JOBS = {}  # voice_id -> {"status": ..., "audio_base64": ..., "mime_type": ..., "ts": ...}
+
+EDGE_VOICES = {
+    "ps": "ps-AF-GulNawazNeural",
+    "ur": "ur-PK-AsadNeural",
+    "en": "en-GB-RyanNeural",
+}
+
+
+def transcribe_fast(audio_bytes: bytes, mime_type: str) -> str:
+    """Groq Whisper speech-to-text. Uses llm.transcribe_audio, which already
+    retries when Whisper guesses an unsupported language (e.g. Tamil) and
+    falls back to Gemini. The Whisper model is set by GROQ_STT_MODEL in .env:
+        GROQ_STT_MODEL=whisper-large-v3        (more accurate)
+        GROQ_STT_MODEL=whisper-large-v3-turbo  (faster, the current default)"""
+    return llm.transcribe_audio(audio_bytes, mime_type)
+
+
+async def _edge_tts_bytes(text: str, voice: str) -> bytes:
+    import edge_tts  # pip install edge-tts
+    communicate = edge_tts.Communicate(text, voice)
+    audio = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio.extend(chunk["data"])
+    return bytes(audio)
+
+
 def text_to_speech(text: str) -> str:
-    """Voice replies use Gemini's text-to-speech. Raises if it fails;
-    the caller then sends the text reply without audio."""
+    """OLD Gemini text-to-speech, now kept only as a backup if Edge-TTS fails.
+    Raises if it fails."""
     if not llm.gemini_client:
         raise RuntimeError("Gemini key not set - text-to-speech unavailable")
 
@@ -962,13 +1287,52 @@ def text_to_speech(text: str) -> str:
     raise last_error
 
 
+def run_voice_job(voice_id: str, text: str):
+    """Runs AFTER the text reply has already been sent to the customer."""
+    time.sleep(1)  # voice follows the text by about 1 second
+    # drop old jobs so memory doesn't grow
+    for old_id in [k for k, v in VOICE_JOBS.items() if time.time() - v.get("ts", 0) > 600]:
+        VOICE_JOBS.pop(old_id, None)
+    try:
+        voice = EDGE_VOICES[lang_code(text)]
+        audio = asyncio.run(_edge_tts_bytes(text, voice))
+        if not audio:
+            raise RuntimeError("Edge-TTS returned no audio")
+        VOICE_JOBS[voice_id] = {
+            "status": "ready", "mime_type": "audio/mpeg", "ts": time.time(),
+            "audio_base64": base64.b64encode(audio).decode("utf-8"),
+        }
+    except Exception as e:
+        logger.warning(f"Edge-TTS failed, trying Gemini voice: {e}")
+        try:
+            VOICE_JOBS[voice_id] = {
+                "status": "ready", "mime_type": "audio/wav", "ts": time.time(),
+                "audio_base64": text_to_speech(text),
+            }
+        except Exception as e2:
+            logger.error(f"All text-to-speech failed: {e2}")
+            VOICE_JOBS[voice_id] = {"status": "failed", "ts": time.time()}
+
+
+@app.get("/voice-audio/{voice_id}")
+def voice_audio(voice_id: str, x_api_key: str = Header(None)):
+    """The widget polls this every ~0.5 s after getting the text reply."""
+    check_customer_api_key(x_api_key)
+    job = VOICE_JOBS.get(voice_id)
+    if not job:
+        return {"status": "pending"}  # not created yet (1 s delay) or expired
+    return job
+
+
 @app.post("/chat")
-def chat(request: ChatRequest, x_api_key: str = Header(None)):
+def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str] = Query(None)):
     check_customer_api_key(x_api_key)
     logger.info(f"Incoming message: {request.message}")
 
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    shop_key, shop_data = resolve_shop(shop or request.shop)
 
     user_id = request.user_id or "anonymous"
     conversation_id = None
@@ -977,12 +1341,16 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
         try:
             conversation_id = ensure_conversation(user_id, request.conversation_id)
             db.save_message(conversation_id, "user", request.message, "text")
+            # NEW: first message of a conversation = new customer -> alert the owner
+            if db.count_messages(conversation_id) == 1:
+                alert_new_customer(shop_data, user_id, request.message)
         except Exception as e:
             logger.error(f"Could not persist incoming message: {e}")
             conversation_id = None
 
     try:
-        reply = generate_reply(request.message, user_id=user_id, conversation_id=conversation_id)
+        reply = generate_reply(request.message, user_id=user_id,
+                               conversation_id=conversation_id, shop=shop_data)
     except Exception as e:
         logger.error(f"Error during chat: {e}")
         return {"reply": "Sorry, I'm having trouble responding right now. Please try again in a moment."}
@@ -1025,8 +1393,11 @@ def chat(request: ChatRequest, x_api_key: str = Header(None)):
 
 
 @app.post("/voice-chat")
-def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
+def voice_chat(request: VoiceRequest, background_tasks: BackgroundTasks,
+               x_api_key: str = Header(None), shop: Optional[str] = Query(None)):
     check_customer_api_key(x_api_key)
+
+    shop_key, shop_data = resolve_shop(shop or request.shop)
 
     user_id = request.user_id or "anonymous"
     conversation_id = None
@@ -1038,7 +1409,7 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         raise HTTPException(status_code=400, detail="Invalid audio data")
 
     try:
-        transcript = llm.transcribe_audio(audio_bytes, request.mime_type)
+        transcript = transcribe_fast(audio_bytes, request.mime_type)  # Groq Whisper large-v3
         logger.info(f"Voice transcript: {transcript}")
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
@@ -1054,25 +1425,21 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         try:
             conversation_id = ensure_conversation(user_id, request.conversation_id)
             db.save_message(conversation_id, "user", transcript, "voice")
+            if db.count_messages(conversation_id) == 1:
+                alert_new_customer(shop_data, user_id, transcript)
         except Exception as e:
             logger.error(f"Could not persist voice message: {e}")
             conversation_id = None
 
     try:
-        reply = generate_reply(transcript, user_id=user_id, conversation_id=conversation_id)
+        reply = generate_reply(transcript, user_id=user_id,
+                               conversation_id=conversation_id, shop=shop_data)
     except Exception as e:
         logger.error(f"Error generating voice reply: {e}")
         return {"transcript": transcript, "reply": "Sorry, I couldn't process that voice message."}
 
     if reply is None:
         return {"transcript": transcript, "reply": None, "conversation_id": conversation_id, "handed_off": True}
-
-    # If text-to-speech fails, the customer still gets the text reply.
-    reply_audio = None
-    try:
-        reply_audio = text_to_speech(reply)
-    except Exception as e:
-        logger.error(f"Text-to-speech failed, sending text only: {e}")
 
     if DB_AVAILABLE and conversation_id:
         try:
@@ -1081,7 +1448,14 @@ def voice_chat(request: VoiceRequest, x_api_key: str = Header(None)):
         except Exception as e:
             logger.error(f"Could not persist voice reply: {e}")
 
-    result = {"transcript": transcript, "reply": reply, "reply_audio": reply_audio, "conversation_id": conversation_id}
+    # NEW: do NOT wait for text-to-speech. The text goes out right now;
+    # the voice is built in the background and fetched via /voice-audio/{voice_id}
+    voice_id = base64.urlsafe_b64encode(os.urandom(9)).decode("utf-8")
+    VOICE_JOBS[voice_id] = {"status": "pending", "ts": time.time()}
+    background_tasks.add_task(run_voice_job, voice_id, reply)
+
+    result = {"transcript": transcript, "reply": reply, "voice_id": voice_id,
+              "conversation_id": conversation_id}
 
     image_urls = find_reply_images(reply, transcript)
     if image_urls:

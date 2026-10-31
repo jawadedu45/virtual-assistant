@@ -6,3 +6,4 @@ scikit-learn
 groq
 google-genai
 turso-serverless==0.1.0
+edge-tts
