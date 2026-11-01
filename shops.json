@@ -1,8 +1,8 @@
 {
   "bangash": {
     "name": "Bangash Fabrics",
-    "owner_whatsapp": "923001234567",
-    "owner_email": "owner@example.com",
+    "owner_whatsapp": "+923180082536",
+    "owner_email": "jawad.edu45@gmail.com",
     "price_range": "2500-5500",
     "address": "Karkhano Market, Peshawar",
     "products": ["Black Waistcoat 3500", "Navy 4000"],
@@ -27,7 +27,7 @@
   "shop2": {
     "name": "Second Shop Name",
     "owner_whatsapp": "+923180082536",
-    "owner_email": "owner2@example.com",
+    "owner_email": "jawad.edu45@gmail.com",
     "price_range": "2000-6000",
     "address": "Your address here",
     "products": ["Grey Waistcoat 3000", "Brown 3800"],
