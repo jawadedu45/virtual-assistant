@@ -183,14 +183,19 @@ def send_manager_email(subject: str, body: str, to: Optional[str] = None):
 
 def notify_owner(shop: dict, subject: str, body: str):
     """Alerts the shop owner: WhatsApp first, email if WhatsApp fails.
-    Runs in a background thread so the customer's reply is never slowed down."""
+    Vercel freezes the server right after the reply is sent, so a pure
+    background thread can be killed before the alert is delivered. The thread
+    is therefore given up to 6 seconds to finish BEFORE we return."""
     def _run():
         try:
             biz = db.get_business_settings() if DB_AVAILABLE else None
             if biz is not None and biz.get("notifications_enabled") == 0:
+                logger.info("Owner alert skipped: notifications are switched off in business settings")
                 return
+            number = str(shop.get("owner_whatsapp") or "")
+            logger.info(f"Owner alert: sending WhatsApp to number ending {number[-4:] or 'NONE'}: {subject}")
             try:
-                send_whatsapp(shop.get("owner_whatsapp"), f"{subject}\n{body}")
+                send_whatsapp(number, f"{subject}\n{body}")
                 logger.info(f"Owner alerted on WhatsApp: {subject}")
                 return
             except Exception as wa_err:
@@ -199,7 +204,9 @@ def notify_owner(shop: dict, subject: str, body: str):
         except Exception as e:
             logger.error(f"Owner alert failed: {e}")
 
-    threading.Thread(target=_run, daemon=True).start()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=6)
 
 
 def lang_code(text: str) -> str:
@@ -1451,7 +1458,9 @@ def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str
             conversation_id = ensure_conversation(user_id, request.conversation_id)
             db.save_message(conversation_id, "user", request.message, "text")
             # NEW: first message of a conversation = new customer -> alert the owner
-            if db.count_messages(conversation_id) == 1:
+            n_messages = db.count_messages(conversation_id)
+            logger.info(f"Messages in this conversation: {n_messages}")
+            if n_messages == 1:
                 alert_new_customer(shop_data, user_id, request.message)
         except Exception as e:
             logger.error(f"Could not persist incoming message: {e}")
@@ -1539,7 +1548,9 @@ def voice_chat(request: VoiceRequest, background_tasks: BackgroundTasks,
         try:
             conversation_id = ensure_conversation(user_id, request.conversation_id)
             db.save_message(conversation_id, "user", transcript, "voice")
-            if db.count_messages(conversation_id) == 1:
+            n_messages = db.count_messages(conversation_id)
+            logger.info(f"Messages in this conversation: {n_messages}")
+            if n_messages == 1:
                 alert_new_customer(shop_data, user_id, transcript)
         except Exception as e:
             logger.error(f"Could not persist voice message: {e}")
