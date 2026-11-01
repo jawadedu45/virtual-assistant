@@ -266,7 +266,13 @@ def catalog_products() -> list:
             name = (p.get("product_name") or "").strip()
             price = p.get("discount_price") or p.get("price")
             if name and price:
-                items.append({"name": name, "price": float(price), "keywords": p.get("keywords") or ""})
+                items.append({
+                    "name": name, "price": float(price),
+                    "keywords": p.get("keywords") or "",
+                    "color": (p.get("color") or "").strip(),
+                    "size": (p.get("size") or "").strip(),
+                    "stock": p.get("stock"),
+                })
         _catalog_cache["items"] = items
         _catalog_cache["ts"] = time.time()
         return items
@@ -280,6 +286,8 @@ def message_names_product(text: str) -> bool:
     lower = text.lower()
     for p in catalog_products():
         if p["name"].lower() in lower:
+            return True
+        if p.get("color") and p["color"].lower() in lower:
             return True
         for kw in p["keywords"].split(","):
             kw = kw.strip().lower()
@@ -339,11 +347,23 @@ FAST_MAX_TOKENS = int(os.getenv("FAST_MAX_TOKENS", "300"))
 FAST_MAX_TOKENS_GEMINI = int(os.getenv("FAST_MAX_TOKENS_GEMINI", "1024"))
 
 
+def describe_product(p: dict) -> str:
+    """One compact line per product: 'Name (color, size) PRICE [out of stock]'."""
+    details = ", ".join(x for x in (p.get("color"), p.get("size")) if x)
+    line = p["name"] + (f" ({details})" if details else "") + f" {fmt_price(p['price'])}"
+    try:
+        if p.get("stock") is not None and int(p["stock"]) <= 0:
+            line += " [out of stock]"
+    except (TypeError, ValueError):
+        pass
+    return line
+
+
 def build_fast_prompt(shop: dict) -> str:
     # Products and prices come from the DATABASE; shops.json is only the fallback.
     items = catalog_products()
     if items:
-        products = ", ".join(f"{p['name']} {fmt_price(p['price'])}" for p in items[:25])
+        products = "; ".join(describe_product(p) for p in items[:60])
         price_range = f"{fmt_price(min(p['price'] for p in items))}-{fmt_price(max(p['price'] for p in items))}"
     else:
         products = ", ".join(shop.get("products", []))
@@ -351,7 +371,9 @@ def build_fast_prompt(shop: dict) -> str:
     return (
         f"You are salesman for {shop.get('name')}. Products: {products}. "
         f"Prices {price_range} PKR. Reply in same language as user "
-        f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI."
+        f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI. "
+        f"Only talk about products in the list; colors and sizes are in brackets. "
+        f"If something is not in the list, say you will check with the team."
     )
 
 
