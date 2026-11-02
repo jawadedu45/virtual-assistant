@@ -555,7 +555,7 @@ def build_system_prompt(relevant_chunk: str, memory_context: str, shop_name: Opt
         f"TAKING ORDERS: When a customer wants to buy something, collect the details step by "
         f"step in natural conversation — don't dump every question at once. You need: the "
         f"product (confirmed via search_products_tool), color, size, quantity, their name, "
-        f"and phone number (delivery address and payment method too if relevant). Once you "
+        f"phone number and full delivery address (payment method too if relevant). Once you "
         f"have enough, call create_order_tool — this only creates a PENDING order. Then show "
         f"the customer a clear order summary (product, color, size, quantity, total price) and "
         f"explicitly ask them to confirm. Only call confirm_order_tool after they clearly say "
@@ -1118,23 +1118,22 @@ def make_order_tools(user_id: str, conversation_id: str, shop: dict):
             )
 
             # NEW: WhatsApp alert to the shop owner (email is the backup)
-            phone = (order.get("customer_phone") if order else None) or customer.get("phone") or "-"
-            address = (order.get("delivery_address") if order else None) or "-"
+            cust_name = (order.get("customer_name") if order else None) or customer.get("name") or "Unknown"
+            phone = (order.get("customer_phone") if order else None) or customer.get("phone") or "Not given"
+            address = (order.get("delivery_address") if order else None) or "Not given"
             notify_owner(
                 shop,
-                f"Order confirmed - {product_name}",
+                "Order Confirmed ✅",
                 (
                     f"Shop: {shop.get('name')}\n"
-                    f"{customer_label} just confirmed an order.\n\n"
+                    f"Name: {cust_name}\n"
+                    f"Phone: {phone}\n"
+                    f"Address: {address}\n"
                     f"Product: {product_name}\n"
                     f"Size: {(order.get('size') if order else None) or '-'}\n"
                     f"Quantity: {(order.get('quantity') if order else None) or '-'}\n"
                     f"Total: {total if total is not None else '-'} PKR\n"
-                    f"Customer phone: {phone}\n"
-                    f"Delivery address: {address}\n"
-                    f"Order ID: {order_id}\n\n"
-                    f"Please contact the customer to arrange delivery. "
-                    f"Full details are in the admin dashboard, Orders tab."
+                    f"Order ID: {order_id}"
                 ),
             )
         except Exception as e:
