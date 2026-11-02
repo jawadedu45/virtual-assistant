@@ -1346,13 +1346,40 @@ EDGE_VOICES = {
 }
 
 
+def gemini_transcribe(audio_bytes: bytes, mime_type: str) -> str:
+    """Gemini speech-to-text. Used when Groq Whisper returns empty text or text
+    in a wrong script (Whisper often fails on Pashto)."""
+    if not llm.gemini_client:
+        raise RuntimeError("Gemini client not available")
+    base_mime = (mime_type or "audio/webm").split(";")[0]
+    r = llm.gemini_client.models.generate_content(
+        model=llm.GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=audio_bytes, mime_type=base_mime),
+            "Transcribe this audio exactly as spoken. The speaker uses English, Urdu "
+            "or Pashto. Write Urdu and Pashto in Arabic script, in the same language "
+            "spoken. Never translate and never use any other language or script. "
+            "Reply with ONLY the transcribed text, nothing else.",
+        ],
+    )
+    return (r.text or "").strip()
+
+
 def transcribe_fast(audio_bytes: bytes, mime_type: str) -> str:
-    """Groq Whisper speech-to-text. Uses llm.transcribe_audio, which already
-    retries when Whisper guesses an unsupported language (e.g. Tamil) and
-    falls back to Gemini. The Whisper model is set by GROQ_STT_MODEL in .env:
-        GROQ_STT_MODEL=whisper-large-v3        (more accurate)
-        GROQ_STT_MODEL=whisper-large-v3-turbo  (faster, the current default)"""
-    return llm.transcribe_audio(audio_bytes, mime_type)
+    """Speech-to-text. Groq Whisper first (fast); if it returns empty text or a
+    wrong script (e.g. Cyrillic for Pashto), Gemini transcribes instead.
+    The Whisper model is set by GROQ_STT_MODEL in .env / Vercel:
+        whisper-large-v3-turbo (current default, faster)
+        whisper-large-v3       (more accurate)"""
+    text = ""
+    try:
+        text = llm.transcribe_audio(audio_bytes, mime_type)
+    except Exception as e:
+        logger.warning(f"Groq transcription failed: {e}")
+    if text and text.strip() and is_supported_script(text):
+        return text
+    logger.info(f"Groq transcript unusable ({text!r}), trying Gemini")
+    return gemini_transcribe(audio_bytes, mime_type)
 
 
 async def _edge_tts_bytes(text: str, voice: str) -> bytes:
