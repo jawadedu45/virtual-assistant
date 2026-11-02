@@ -301,7 +301,9 @@ def message_names_product(text: str) -> bool:
             kw = kw.strip().lower()
             if kw and kw in lower:
                 return True
-    return False
+    # Pashto / Urdu product and color words (واسکټ, تور, ...) are mapped to
+    # English words, then matched against the catalog
+    return bool(match_products(text, limit=1))
 
 
 def catalog_price_reply(lang: str):
