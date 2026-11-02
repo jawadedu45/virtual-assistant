@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -380,13 +380,20 @@ def build_fast_prompt(shop: dict) -> str:
         f"Prices {price_range} PKR. Reply in same language as user "
         f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI. "
         f"Only talk about products in the list; colors and sizes are in brackets. "
-        f"If something is not in the list, say you will check with the team."
+        f"If something is not in the list, say you will check with the team. "
+        f"Customers may write product words in Pashto or Urdu: "
+        f"واسکټ / وستکټ / ویسٹ کوٹ = waistcoat, ټوکر / کپڑا = fabric, "
+        f"تور / کالا = black, نیلي / نیلا = blue, سپین / سفید = white, خړ / گرے = grey, "
+        f"بیه / قیمت = price, شته / ہے = available, سایز = size."
     )
 
 
-def fast_reply(shop: dict, history: list) -> str:
-    """Short, quick answer. Groq 8b-instant first; Gemini ONLY if Groq fails."""
+def fast_reply(shop: dict, history: list, lang_name: Optional[str] = None) -> str:
+    """Short, quick answer. Groq first; Gemini ONLY if Groq fails."""
     system = build_fast_prompt(shop)
+    if lang_name:
+        system += (f" The customer writes in {lang_name}. "
+                   f"Write your whole reply in {lang_name}, in Arabic script.")
     recent = history[-4:]  # a little context, still very fast
 
     # --- Groq (main) ---
@@ -1281,7 +1288,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         if not history or history[-1]["role"] != "user":
             history.append({"role": "user", "content": message})
         try:
-            return clean_reply(fast_reply(shop, history))
+            return clean_reply(fast_reply(shop, history, detect_language(message)))
         except Exception as e:
             logger.error(f"Fast reply failed on Groq and Gemini: {e}")
             return "Please wait, the owner will contact you shortly."
@@ -1333,12 +1340,10 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
 
 # =======================================================================
 # NEW (TASK 3): FAST VOICE
-# Voice -> Groq Whisper -> text -> cache -> Groq LLM -> send TEXT now
-# -> then build the VOICE reply in the background (starts 1 second later).
-# The widget collects the audio from GET /voice-audio/{voice_id}.
+# Voice -> Whisper (Gemini for Pashto) -> text -> cache -> Groq LLM
+# -> TEXT reply is sent immediately by /voice-chat
+# -> the chat widget then calls POST /tts to get the VOICE reply.
 # =======================================================================
-VOICE_JOBS = {}  # voice_id -> {"status": ..., "audio_base64": ..., "mime_type": ..., "ts": ...}
-
 EDGE_VOICES = {
     "ps": "ps-AF-GulNawazNeural",
     "ur": "ur-PK-AsadNeural",
@@ -1347,8 +1352,8 @@ EDGE_VOICES = {
 
 
 def gemini_transcribe(audio_bytes: bytes, mime_type: str) -> str:
-    """Gemini speech-to-text. Used when Groq Whisper returns empty text or text
-    in a wrong script (Whisper often fails on Pashto)."""
+    """Gemini speech-to-text. Used for Pashto and for anything Whisper is not
+    sure about (Whisper often turns Pashto into gibberish)."""
     if not llm.gemini_client:
         raise RuntimeError("Gemini client not available")
     base_mime = (mime_type or "audio/webm").split(";")[0]
@@ -1356,9 +1361,19 @@ def gemini_transcribe(audio_bytes: bytes, mime_type: str) -> str:
         model=llm.GEMINI_MODEL,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type=base_mime),
-            "Transcribe this audio exactly as spoken. The speaker uses English, Urdu "
-            "or Pashto. Write Urdu and Pashto in Arabic script, in the same language "
-            "spoken. Never translate and never use any other language or script. "
+            "Transcribe this audio exactly as spoken. The speaker uses English, "
+            "Urdu (اردو) or Pashto (پښتو). Write Urdu and Pashto in Arabic script, in the "
+            "same language that is spoken. Never translate, never transliterate into "
+            "English letters, and never use any other language or script. "
+            "CONTEXT: the speaker is a customer of a waistcoat and fabric shop in "
+            "Peshawar, Pakistan. Words you will often hear. "
+            "Pashto: واسکټ (waistcoat), ټوکر (fabric), بیه (price), رنګ (color), تور (black), "
+            "نیلي (blue), سپین (white), شین (green), خړ (grey), سور (red), سایز (size), "
+            "څومره (how much), شته (available), اخیستل (to buy), آرډر (order). "
+            "Urdu: ویسٹ کوٹ (waistcoat), کپڑا (fabric), قیمت (price), رنگ (color), کالا (black), "
+            "نیلا (blue), سفید (white), سائز (size), کتنے کا ہے (how much), ہے (available), "
+            "آرڈر (order). English: waistcoat, fabric, price, color, size, delivery, order. "
+            "When a word sounds close to one of these, prefer it. "
             "Reply with ONLY the transcribed text, nothing else.",
         ],
     )
@@ -1366,20 +1381,33 @@ def gemini_transcribe(audio_bytes: bytes, mime_type: str) -> str:
 
 
 def transcribe_fast(audio_bytes: bytes, mime_type: str) -> str:
-    """Speech-to-text. Groq Whisper first (fast); if it returns empty text or a
-    wrong script (e.g. Cyrillic for Pashto), Gemini transcribes instead.
-    The Whisper model is set by GROQ_STT_MODEL in .env / Vercel:
-        whisper-large-v3-turbo (current default, faster)
-        whisper-large-v3       (more accurate)"""
-    text = ""
+    """Speech-to-text for English, Urdu and Pashto.
+    1) Groq Whisper listens first (fast). Its text is trusted ONLY when Whisper
+       says the language is English or Urdu.
+    2) For anything else (Pashto is often detected as Icelandic, Turkish, etc.
+       and written as gibberish) Gemini transcribes the audio instead.
+    The Whisper model is set by GROQ_STT_MODEL in .env / Vercel."""
+    base_mime = (mime_type or "audio/webm").split(";")[0]
+    ext = base_mime.split("/")[-1] or "webm"
+    text, detected = "", ""
     try:
-        text = llm.transcribe_audio(audio_bytes, mime_type)
+        if llm.groq_client:
+            text, detected = llm._groq_transcribe(audio_bytes, ext)
+            logger.info(f"Whisper language={detected!r} text={text!r}")
     except Exception as e:
         logger.warning(f"Groq transcription failed: {e}")
-    if text and text.strip() and is_supported_script(text):
+
+    if text and detected in ("english", "urdu") and is_supported_script(text):
         return text
-    logger.info(f"Groq transcript unusable ({text!r}), trying Gemini")
-    return gemini_transcribe(audio_bytes, mime_type)
+
+    logger.info(f"Whisper not trusted (language={detected!r}), using Gemini")
+    try:
+        return gemini_transcribe(audio_bytes, mime_type)
+    except Exception as e:
+        logger.warning(f"Gemini transcription failed: {e}")
+        if text and is_supported_script(text):
+            return text  # better than nothing
+        raise
 
 
 async def _edge_tts_bytes(text: str, voice: str) -> bytes:
@@ -1428,41 +1456,39 @@ def text_to_speech(text: str) -> str:
     raise last_error
 
 
-def run_voice_job(voice_id: str, text: str):
-    """Runs AFTER the text reply has already been sent to the customer."""
-    time.sleep(1)  # voice follows the text by about 1 second
-    # drop old jobs so memory doesn't grow
-    for old_id in [k for k, v in VOICE_JOBS.items() if time.time() - v.get("ts", 0) > 600]:
-        VOICE_JOBS.pop(old_id, None)
+def synthesize_voice(text: str):
+    """Text -> speech. Returns (base64_audio, mime_type).
+    Edge-TTS first (Pashto / Urdu / English voices); Gemini voice as backup."""
     try:
         voice = EDGE_VOICES[lang_code(text)]
         audio = asyncio.run(_edge_tts_bytes(text, voice))
         if not audio:
             raise RuntimeError("Edge-TTS returned no audio")
-        VOICE_JOBS[voice_id] = {
-            "status": "ready", "mime_type": "audio/mpeg", "ts": time.time(),
-            "audio_base64": base64.b64encode(audio).decode("utf-8"),
-        }
+        return base64.b64encode(audio).decode("utf-8"), "audio/mpeg"
     except Exception as e:
         logger.warning(f"Edge-TTS failed, trying Gemini voice: {e}")
-        try:
-            VOICE_JOBS[voice_id] = {
-                "status": "ready", "mime_type": "audio/wav", "ts": time.time(),
-                "audio_base64": text_to_speech(text),
-            }
-        except Exception as e2:
-            logger.error(f"All text-to-speech failed: {e2}")
-            VOICE_JOBS[voice_id] = {"status": "failed", "ts": time.time()}
+        return text_to_speech(text), "audio/wav"
 
 
-@app.get("/voice-audio/{voice_id}")
-def voice_audio(voice_id: str, x_api_key: str = Header(None)):
-    """The widget polls this every ~0.5 s after getting the text reply."""
+class TTSRequest(BaseModel):
+    text: str
+
+
+@app.post("/tts")
+def tts(request: TTSRequest, x_api_key: str = Header(None)):
+    """The chat widget calls this AFTER it has already shown the text reply.
+    Stateless on purpose: Vercel runs many short-lived copies of the server,
+    so nothing is remembered between requests."""
     check_customer_api_key(x_api_key)
-    job = VOICE_JOBS.get(voice_id)
-    if not job:
-        return {"status": "pending"}  # not created yet (1 s delay) or expired
-    return job
+    text = (request.text or "").strip()[:500]  # keep it short; stops misuse as a free TTS
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    try:
+        audio_base64, mime_type = synthesize_voice(text)
+        return {"audio_base64": audio_base64, "mime_type": mime_type}
+    except Exception as e:
+        logger.error(f"All text-to-speech failed: {e}")
+        raise HTTPException(status_code=503, detail="Voice unavailable")
 
 
 @app.post("/chat")
@@ -1542,8 +1568,8 @@ def chat(request: ChatRequest, x_api_key: str = Header(None), shop: Optional[str
 
 
 @app.post("/voice-chat")
-def voice_chat(request: VoiceRequest, background_tasks: BackgroundTasks,
-               x_api_key: str = Header(None), shop: Optional[str] = Query(None)):
+def voice_chat(request: VoiceRequest, x_api_key: str = Header(None),
+               shop: Optional[str] = Query(None)):
     check_customer_api_key(x_api_key)
 
     shop_key, shop_data = resolve_shop(shop or request.shop)
@@ -1599,14 +1625,8 @@ def voice_chat(request: VoiceRequest, background_tasks: BackgroundTasks,
         except Exception as e:
             logger.error(f"Could not persist voice reply: {e}")
 
-    # NEW: do NOT wait for text-to-speech. The text goes out right now;
-    # the voice is built in the background and fetched via /voice-audio/{voice_id}
-    voice_id = base64.urlsafe_b64encode(os.urandom(9)).decode("utf-8")
-    VOICE_JOBS[voice_id] = {"status": "pending", "ts": time.time()}
-    background_tasks.add_task(run_voice_job, voice_id, reply)
-
-    result = {"transcript": transcript, "reply": reply, "voice_id": voice_id,
-              "conversation_id": conversation_id}
+    # The text goes out right now. The widget then asks POST /tts for the voice.
+    result = {"transcript": transcript, "reply": reply, "conversation_id": conversation_id}
 
     image_urls = find_reply_images(reply, transcript)
     if image_urls:

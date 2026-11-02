@@ -237,24 +237,25 @@ function playBase64Audio(base64, mimeType) {
   audio.play().catch((err) => console.warn('Audio play blocked:', err));
 }
 
-// NEW: the voice reply is built by the server AFTER the text is sent.
-// Ask for it every 0.5 seconds (up to ~15 seconds) and play it when ready.
-async function fetchAndPlayVoice(voiceId) {
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    try {
-      const response = await fetch(`/voice-audio/${encodeURIComponent(voiceId)}`, {
-        headers: { 'X-API-Key': API_KEY }
-      });
-      const job = await response.json();
-      if (job.status === 'ready' && job.audio_base64) {
-        playBase64Audio(job.audio_base64, job.mime_type);
-        return;
-      }
-      if (job.status === 'failed') return; // text reply is already shown
-    } catch (error) {
-      console.warn('Voice check failed:', error);
+// NEW: the text reply is already on screen. Now ask the server for the voice
+// version of it (one request, nothing is stored between requests).
+async function speakReply(text) {
+  try {
+    const response = await fetch('/tts', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY
+      },
+      body: JSON.stringify({ text })
+    });
+    if (!response.ok) return; // text reply is already shown
+    const data = await response.json();
+    if (data.audio_base64) {
+      playBase64Audio(data.audio_base64, data.mime_type);
     }
+  } catch (error) {
+    console.warn('Voice reply failed:', error);
   }
 }
 
@@ -292,11 +293,9 @@ async function sendVoiceMessage(audioBlob) {
         addVideoBubble(data.video_url);
       }
 
-      // 2) VOICE a moment later
-      if (data.voice_id) {
-        fetchAndPlayVoice(data.voice_id); // not awaited, so nothing is blocked
-      } else if (data.reply_audio) {
-        playBase64Audio(data.reply_audio, 'audio/wav'); // old server format
+      // 2) VOICE right after (not awaited, so nothing is blocked)
+      if (data.reply) {
+        speakReply(data.reply);
       }
 
     } catch (error) {
