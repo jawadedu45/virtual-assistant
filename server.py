@@ -455,9 +455,16 @@ def fast_reply(shop: dict, history: list, lang_name: Optional[str] = None, messa
     Exception: Pashto goes to Gemini first, because Groq's models write poor
     Pashto (set PASHTO_USE_GEMINI=false in the environment to turn this off)."""
     system = build_fast_prompt(shop, message)
-    if lang_name:
+    # No Arabic letters at all = the customer wrote in English
+    if lang_name is None and message and not re.search(r"[\u0600-\u06FF]", message):
+        lang_name = "English"
+    if lang_name == "English":
+        system += (" The customer's latest message is in English. Reply in English, "
+                   "even if earlier messages were in another language.")
+    elif lang_name:
         system += (f" The customer writes in {lang_name}. "
-                   f"Write your whole reply in {lang_name}, in Arabic script.")
+                   f"Write your whole reply in {lang_name}, in Arabic script, "
+                   f"even if earlier messages were in another language.")
     if lang_name == "Pashto":
         system += (" Use simple, natural spoken Pashto, not Urdu: say مننه for thank you "
                    "(never شکریه), هو for yes, نه for no, شته for available, نشته for not "
