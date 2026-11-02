@@ -275,6 +275,7 @@ def catalog_products() -> list:
             if name and price:
                 items.append({
                     "name": name, "price": float(price),
+                    "regular": float(p.get("price") or price),
                     "keywords": p.get("keywords") or "",
                     "color": (p.get("color") or "").strip(),
                     "size": (p.get("size") or "").strip(),
@@ -358,6 +359,8 @@ def describe_product(p: dict) -> str:
     """One compact line per product: 'Name (color, size) PRICE [out of stock]'."""
     details = ", ".join(x for x in (p.get("color"), p.get("size")) if x)
     line = p["name"] + (f" ({details})" if details else "") + f" {fmt_price(p['price'])}"
+    if p.get("regular") and p["regular"] > p["price"]:
+        line += f" (sale price, regular {fmt_price(p['regular'])})"
     try:
         if p.get("stock") is not None and int(p["stock"]) <= 0:
             line += " [out of stock]"
@@ -366,7 +369,57 @@ def describe_product(p: dict) -> str:
     return line
 
 
-def build_fast_prompt(shop: dict) -> str:
+# Pashto / Urdu product and color words -> English words used in the catalog
+GLOSSARY = {
+    "واسکټ": "waistcoat", "وستکټ": "waistcoat", "واسکٹ": "waistcoat",
+    "ویسٹ کوٹ": "waistcoat", "ویسکوټ": "waistcoat",
+    "ټوکر": "fabric", "کپڑا": "fabric",
+    "تور": "black", "کالا": "black", "کالے": "black",
+    "نیلي": "blue", "نیلا": "blue", "نیلے": "blue",
+    "سپین": "white", "سفید": "white",
+    "خړ": "grey", "گرے": "grey", "سلیٹی": "grey",
+    "سور": "red", "لال": "red",
+    "شین": "green", "سبز": "green",
+    "ګلابي": "pink", "گلابی": "pink",
+    "ژېړ": "yellow", "پیلا": "yellow",
+    "نسواري": "brown", "بھورا": "brown",
+    "طلایي": "golden", "سنہری": "golden", "گولڈن": "golden",
+}
+_STOP_WORDS = {
+    "the", "you", "have", "for", "and", "with", "what", "how", "much", "price", "any",
+    "does", "there", "your", "can", "get", "want", "need", "size", "color", "colour",
+    "please", "show", "about", "are", "this", "that", "hello", "salam",
+}
+
+
+def match_products(message: str, limit: int = 5) -> list:
+    """Looks up the products that match the customer's words IN THE DATABASE
+    (name, color, keywords), so the AI is given the exact prices instead of
+    having to pick them out of a long list."""
+    lower = message.lower()
+    tokens = set(re.findall(r"[a-z]{3,}", lower))
+    tokens |= {english for word, english in GLOSSARY.items() if word in lower}
+    tokens -= _STOP_WORDS
+    if not tokens:
+        return []
+    scored = []
+    for p in catalog_products():
+        name, color, kws = p["name"].lower(), p["color"].lower(), p["keywords"].lower()
+        score = 0
+        for t in tokens:
+            if t in color:
+                score += 3
+            if t in name:
+                score += 2
+            if t in kws:
+                score += 1
+        if score:
+            scored.append((score, p))
+    scored.sort(key=lambda pair: -pair[0])
+    return [p for _, p in scored[:limit]]
+
+
+def build_fast_prompt(shop: dict, message: str = "") -> str:
     # Products and prices come from the DATABASE; shops.json is only the fallback.
     items = catalog_products()
     if items:
@@ -375,30 +428,43 @@ def build_fast_prompt(shop: dict) -> str:
     else:
         products = ", ".join(shop.get("products", []))
         price_range = shop.get("price_range", "2500-5500")
-    return (
+    prompt = (
         f"You are salesman for {shop.get('name')}. Products: {products}. "
         f"Prices {price_range} PKR. Reply in same language as user "
         f"(Pashto/Urdu/English). Keep under 20 words. You are shop salesman, not AI. "
         f"Only talk about products in the list; colors and sizes are in brackets. "
         f"If something is not in the list, say you will check with the team. "
+        f"Every product has its own price; never reuse or guess a price. "
         f"Customers may write product words in Pashto or Urdu: "
         f"واسکټ / وستکټ / ویسٹ کوٹ = waistcoat, ټوکر / کپڑا = fabric, "
         f"تور / کالا = black, نیلي / نیلا = blue, سپین / سفید = white, خړ / گرے = grey, "
         f"بیه / قیمت = price, شته / ہے = available, سایز = size."
     )
+    matches = match_products(message) if message else []
+    if matches:
+        prompt += (" PRODUCTS THAT MATCH THIS QUESTION, taken from the database. "
+                   "Use ONLY these exact prices for them: "
+                   + "; ".join(describe_product(p) for p in matches) + ".")
+    return prompt
 
 
-def fast_reply(shop: dict, history: list, lang_name: Optional[str] = None) -> str:
-    """Short, quick answer. Groq first; Gemini ONLY if Groq fails."""
-    system = build_fast_prompt(shop)
+def fast_reply(shop: dict, history: list, lang_name: Optional[str] = None, message: str = "") -> str:
+    """Short, quick answer. Groq first; Gemini only if Groq fails.
+    Exception: Pashto goes to Gemini first, because Groq's models write poor
+    Pashto (set PASHTO_USE_GEMINI=false in the environment to turn this off)."""
+    system = build_fast_prompt(shop, message)
     if lang_name:
         system += (f" The customer writes in {lang_name}. "
                    f"Write your whole reply in {lang_name}, in Arabic script.")
+    if lang_name == "Pashto":
+        system += (" Use simple, natural spoken Pashto, not Urdu: say مننه for thank you "
+                   "(never شکریه), هو for yes, نه for no, شته for available, نشته for not "
+                   "available, بیه for price, روپۍ for rupees. Write product names exactly as "
+                   "in the list (English); everything else in Pashto.")
     recent = history[-4:]  # a little context, still very fast
 
-    # --- Groq (main) ---
-    t0 = time.perf_counter()
-    try:
+    def _groq() -> str:
+        t0 = time.perf_counter()
         if not llm.groq_client:
             raise RuntimeError("Groq client not available")
         resp = llm.groq_client.chat.completions.create(
@@ -414,30 +480,40 @@ def fast_reply(shop: dict, history: list, lang_name: Optional[str] = None) -> st
             raise RuntimeError("Groq returned empty text")
         logger.info(f"TIMING fast groq {FAST_MODEL_GROQ}: {time.perf_counter() - t0:.2f}s")
         return text
-    except Exception as groq_err:
-        logger.warning(f"Groq fast reply failed, trying Gemini: {groq_err}")
 
-    # --- Gemini (backup, only reached if Groq failed) ---
-    t1 = time.perf_counter()
-    if not llm.gemini_client:
-        raise RuntimeError("Gemini client not available")
-    contents = [
-        types.Content(role="user" if m["role"] == "user" else "model",
-                      parts=[types.Part(text=m["content"])])
-        for m in recent
-    ]
-    resp = llm.gemini_client.models.generate_content(
-        model=FAST_MODEL_GEMINI,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system, max_output_tokens=FAST_MAX_TOKENS_GEMINI, temperature=0.7
-        ),
-    )
-    text = (resp.text or "").strip()
-    if not text:
-        raise RuntimeError("Gemini returned empty text")
-    logger.info(f"TIMING fast gemini {FAST_MODEL_GEMINI}: {time.perf_counter() - t1:.2f}s")
-    return text
+    def _gemini() -> str:
+        t0 = time.perf_counter()
+        if not llm.gemini_client:
+            raise RuntimeError("Gemini client not available")
+        contents = [
+            types.Content(role="user" if m["role"] == "user" else "model",
+                          parts=[types.Part(text=m["content"])])
+            for m in recent
+        ]
+        resp = llm.gemini_client.models.generate_content(
+            model=FAST_MODEL_GEMINI,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system, max_output_tokens=FAST_MAX_TOKENS_GEMINI, temperature=0.7
+            ),
+        )
+        text = (resp.text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned empty text")
+        logger.info(f"TIMING fast gemini {FAST_MODEL_GEMINI}: {time.perf_counter() - t0:.2f}s")
+        return text
+
+    prefer_gemini = (lang_name == "Pashto"
+                     and os.getenv("PASHTO_USE_GEMINI", "true").lower() == "true")
+    attempts = [_gemini, _groq] if prefer_gemini else [_groq, _gemini]
+    last_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except Exception as e:
+            logger.warning(f"Fast reply via {attempt.__name__} failed: {e}")
+            last_error = e
+    raise last_error
 
 
 # Normal chat uses the fast path above. Ordering, human-handoff and
@@ -1288,7 +1364,7 @@ def generate_reply(message: str, user_id: str = None, conversation_id: str = Non
         if not history or history[-1]["role"] != "user":
             history.append({"role": "user", "content": message})
         try:
-            return clean_reply(fast_reply(shop, history, detect_language(message)))
+            return clean_reply(fast_reply(shop, history, detect_language(message), message))
         except Exception as e:
             logger.error(f"Fast reply failed on Groq and Gemini: {e}")
             return "Please wait, the owner will contact you shortly."
